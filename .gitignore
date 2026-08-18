@@ -1,0 +1,91 @@
+# ============================
+# Python
+# ============================
+
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ============================
+# Python environments
+# ============================
+
+.venv/
+venv/
+env/
+ENV/
+
+# ============================
+# IDE / editor files
+# ============================
+
+.vscode/
+.idea/
+
+# ============================
+# Jupyter
+# ============================
+
+.ipynb_checkpoints/
+
+# ============================
+# Logs and temporary files
+# ============================
+
+*.log
+*.tmp
+*.swp
+*.swo
+
+# ============================
+# Slurm output
+# ============================
+
+slurm-*.out
+slurm-*.err
+
+# ============================
+# Training outputs
+# ============================
+
+checkpoints/
+runs/
+wandb/
+tensorboard/
+outputs/
+
+# ============================
+# Trained models
+# ============================
+
+*.pt
+*.pth
+*.ckpt
+*.zip
+
+# ============================
+# Large generated data
+# ============================
+
+data/generated/
+results/raw/
+
+# ============================
+# OS files
+# ============================
+
+.DS_Store
+Thumbs.db
+
+# ============================
+# Secrets / credentials
+# ============================
+
+.env
+*.pem
+*.key
+credentials*
+secrets*
