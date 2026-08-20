@@ -35,6 +35,29 @@ class TopologyConfig:
     device: str = "cuda:0"
 
     @property
+    def num_sites(self) -> int:
+        return (
+            1 
+            + 3
+            * self.num_rings
+            * (self.num_rings + 1)
+        )
+
+    @property
+    def num_cells(self) -> int:
+        return (
+            self.num_sites 
+            * self.num_sectors_per_site
+        )
+
+    @property
+    def num_ues(self) -> int:
+        return (
+            self.num_cells
+            * self.num_ut_per_sector
+        )
+
+    @property
     def ut_speed_mps(self) -> float:
         """Convert UE speed from km/h to m/s."""
         return self.ut_speed_kmh / 3.6
@@ -127,8 +150,8 @@ def validate_evaluation_topology(
         AssertionError: If any of the validation checks fail.
     """
 
-    expected_num_cells = 21
-    expected_num_ues = 210
+    expected_num_cells = config.num_cells
+    expected_num_ues = config.num_ues
 
     expected_ut_shape =(
         config.batch_size,
