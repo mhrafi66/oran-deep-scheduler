@@ -29,6 +29,7 @@ class ChannelConfig:
     enable_pathloss: bool = True
     enable_shadow_fading: bool = True
     precision: str = "single"
+    device:str = "cuda:0"
     seed: int = 42
 
     @property 
@@ -79,6 +80,8 @@ def create_sanity_arrays(
         polarization_type = "V",
         antenna_pattern = "38.901",
         carrier_frequency = config.carrier_frequency_hz,
+        precision = config.precision,
+        device = config.device
     )
 
     ut_array = PanelArray(
@@ -88,6 +91,8 @@ def create_sanity_arrays(
         polarization_type = "V",
         antenna_pattern = "omni",
         carrier_frequency = config.carrier_frequency_hz,
+        precision = config.precision,
+        device = config.device
     )
 
     return bs_array, ut_array
@@ -106,6 +111,7 @@ def create_training_resource_grid(
         subcarrier_spacing = config.subcarrier_spacing_hz,
         num_tx = 1,
         num_streams_per_tx = 1,
+        device = config.device
     )
 
 
@@ -128,6 +134,7 @@ def create_uma_channel_model(
         enable_pathloss = config.enable_pathloss,
         enable_shadow_fading = config.enable_shadow_fading,
         precision = config.precision,
+        device = config.device
     )
 
 def attach_topology_to_channel(
@@ -178,6 +185,8 @@ def generate_frequency_channel(
     channel_generator = GenerateOFDMChannel(
         channel_model = channel_model,
         resource_grid = resource_grid,
+        precision = channel_config.precision,
+        device = channel_config.device
     )
 
     h_freq = channel_generator(
