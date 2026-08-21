@@ -3,6 +3,7 @@ from pathlib import Path
 import matplotlib
 import torch
 from sionna.sys import HexGrid, gen_hexgrid_topology
+from sionna.phy import config as sionna_config
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -30,6 +31,8 @@ class TopologyConfig:
     ut_height_m: float = 1.5
 
     ut_speed_kmh: float = 3.0
+
+    seed: int = 42
 
     precision: str = "single"
     device: str = "cuda:0"
@@ -94,7 +97,9 @@ def generate_topology(
     Returns:
         Generated topology data.
     """
-
+    sionna_config.seed = config.seed
+    torch.manual_seed(config.seed)
+    
     topology = gen_hexgrid_topology(
         batch_size=config.batch_size,
         num_rings=config.num_rings,
