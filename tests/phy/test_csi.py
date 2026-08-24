@@ -5,6 +5,10 @@ from oran_scheduler.phy.csi import (
     extract_serving_mimo_rbg_channel,
 )
 
+from oran_scheduler.phy.csi import (
+    compute_ideal_svd_csi,
+)
+
 def test_extract_serving_mimo_rbg_channel():
     device = "cuda:0"
 
@@ -257,4 +261,254 @@ def test_rank_one_channel_has_tiny_second_mode():
     )
 
     assert ratio < 1.0e-6
+
+
+
+def test_compute_ideal_svd_csi_rank_two():
+    device = "cuda:0"
+
+    h = torch.zeros(
+        (
+            1,  # batch
+            1,  # UE
+            2,  # RBG
+            1,  # OFDM symbol
+            2,  # subcarriers
+            2,  # RX
+            2,  # TX
+        ),
+        dtype=torch.complex64,
+        device=device,
+    )
+
+
+    channel_matrix = torch.tensor(
+        [
+            [3.0, 0.0],
+            [0.0, 1.0],
+        ],
+        dtype=torch.complex64,
+        device=device,
+    )
+
+    h[
+        0,
+        0,
+        :,
+        0,
+        :,
+        :,
+        :,
+    ] = channel_matrix
+
+    rank1_score = torch.tensor(
+        [
+            [
+                [2.0, 2.0]
+            ]
+        ],
+        device=device,
+    )
+
+    rank2_score = torch.tensor(
+        [
+            [
+                [3.0, 3.0]
+            ]
+        ],
+        device=device,
+    )
+
+    result = compute_ideal_svd_csi(
+        h_serving_rbg=h,
+        rank1_rbg_score=rank1_score,
+        rank2_rbg_score=rank2_score,
+    )
+
+    assert result.csi_snapshot.shape == (
+        1,
+        1,
+        2,
+        2,
+        2,
+    )
+
+    assert result.singular_values.shape == (
+        1,
+        1,
+        2,
+        2,
+    )
+
+    assert result.rx_combiners.shape == (
+        1,
+        1,
+        2,
+        2,
+        2,
+    )
+
+    assert result.precoder_directions.shape == (
+        1,
+        1,
+        2,
+        2,
+        2,
+    )
+
+    assert result.effective_channels.shape == (
+        1,
+        1,
+        2,
+        2,
+        2,
+    )
+
+    assert result.layer_valid_mask.shape == (
+        1,
+        1,
+        2,
+        2,
+    )
+
+    assert int(
+        result.recommended_rank[
+            0,
+            0,
+        ].item()
+    ) == 2
+
+    assert torch.all(
+        result.layer_valid_mask[
+            0,
+            0,
+            :,
+            :,
+        ]
+    )
+
+    expected_effective = (
+        result.singular_values.unsqueeze(-1)
+        * result.precoder_directions.conj()
+    )
+
+    torch.testing.assert_close(
+        result.effective_channels,
+        expected_effective,
+        rtol=1.0e-5,
+        atol=1.0e-5,
+    )
+
+    rx_norms = torch.linalg.vector_norm(
+        result.rx_combiners,
+        dim=-1,
+    )
+
+    tx_norms = torch.linalg.vector_norm(
+        result.precoder_directions,
+        dim=-1,
+    )
+
+    torch.testing.assert_close(
+        rx_norms,
+        torch.ones_like(
+            rx_norms
+        ),
+        rtol=1.0e-5,
+        atol=1.0e-5,
+    )
+
+    torch.testing.assert_close(
+        tx_norms,
+        torch.ones_like(
+            tx_norms
+        ),
+        rtol=1.0e-5,
+        atol=1.0e-5,
+    )
+
+
+def test_compute_ideal_svd_csi_rank_one_mask():
+    device = "cuda:0"
+
+    h = torch.zeros(
+        (
+            1,
+            1,
+            1,
+            1,
+            2,
+            2,
+            2,
+        ),
+        dtype=torch.complex64,
+        device=device,
+    )
+
+    h[
+        0,
+        0,
+        0,
+        0,
+        :,
+        :,
+        :,
+    ] = torch.tensor(
+        [
+            [2.0, 0.0],
+            [0.0, 0.5],
+        ],
+        dtype=torch.complex64,
+        device=device,
+    )
+
+    rank1_score = torch.tensor(
+        [
+            [
+                [5.0]
+            ]
+        ],
+        device=device,
+    )
+
+    rank2_score = torch.tensor(
+        [
+            [
+                [4.0]
+            ]
+        ],
+        device=device,
+    )
+
+    result = compute_ideal_svd_csi(
+        h_serving_rbg=h,
+        rank1_rbg_score=rank1_score,
+        rank2_rbg_score=rank2_score,
+    )
+
+    assert int(
+        result.recommended_rank[
+            0,
+            0,
+        ].item()
+    ) == 1
+
+    assert bool(
+        result.layer_valid_mask[
+            0,
+            0,
+            0,
+            0,
+        ].item()
+    )
+
+    assert not bool(
+        result.layer_valid_mask[
+            0,
+            0,
+            0,
+            1,
+        ].item()
+    )
+
 

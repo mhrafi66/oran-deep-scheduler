@@ -60,6 +60,283 @@ class SpatialModeData:
     second_to_first_power_ratio: torch.Tensor
 
 
+@dataclass
+class IdealSVDCSIData:
+    """
+    Ideal-SVD CSI surrogate for the open reproduction.
+
+    IMPORTANT:
+        This is not literal 3GPP RI/PMI feedback.
+
+    csi_snapshot:
+        [batch, UE, RBG, RX_ant, TX_ant]
+
+    recommended_rank:
+        [batch, UE]
+
+        Wideband rank recommendation, limited to 1 or 2.
+
+    singular_values:
+        [batch, UE, RBG, layer]
+
+        First two singular values.
+
+    rx_combiners:
+        [batch, UE, RBG, layer, RX_ant]
+
+        Left-singular-vector receive directions.
+
+    precoder_directions:
+        [batch, UE, RBG, layer, TX_ant]
+
+        Right-singular-vector transmit directions.
+
+    effective_channels:
+        [batch, UE, RBG, layer, TX_ant]
+
+        Effective channel rows:
+
+            f^H H
+
+    layer_valid_mask:
+        [batch, UE, RBG, layer]
+
+        Indicates which layers are enabled by the recommended rank.
+    """
+
+    csi_snapshot: torch.Tensor
+
+    recommended_rank: torch.Tensor
+
+    singular_values: torch.Tensor
+
+    rx_combiners: torch.Tensor
+
+    precoder_directions: torch.Tensor
+
+    effective_channels: torch.Tensor
+
+    layer_valid_mask: torch.Tensor
+
+    csi_subcarrier_index: int
+
+def compute_ideal_svd_csi(
+    h_serving_rbg: torch.Tensor,
+    rank1_rbg_score: torch.Tensor,
+    rank2_rbg_score: torch.Tensor,
+) -> IdealSVDCSIData:
+    """
+    Build the ideal-SVD CSI surrogate used by the open reproduction.
+
+    Args:
+        h_serving_rbg:
+            [
+                batch,
+                UE,
+                RBG,
+                OFDM_symbol,
+                subcarrier_in_RBG,
+                RX_ant,
+                TX_ant,
+            ]
+
+        rank1_rbg_score:
+            [batch, UE, RBG]
+
+        rank2_rbg_score:
+            [batch, UE, RBG]
+
+    The scores are currently the ideal-SVD rank-1 and rank-2
+    spectral efficiencies from rank_diagnostic.py.
+
+    CSI approximation:
+
+        - Rank is chosen wideband by comparing summed rank-1
+          and rank-2 scores across RBGs.
+
+        - One representative subcarrier is used for each RBG.
+
+        - SVD provides ideal spatial directions.
+
+        - At most two layers are retained.
+
+    This is an explicitly documented reproduction substitution,
+    not a literal implementation of 3GPP RI/PMI reporting.
+    """
+
+    if h_serving_rbg.ndim != 7:
+        raise ValueError(
+            "h_serving_rbg must have shape "
+            "[batch, UE, RBG, symbol, subcarrier, "
+            "RX_ant, TX_ant]."
+        )
+
+    expected_score_shape = (
+        h_serving_rbg.shape[0],
+        h_serving_rbg.shape[1],
+        h_serving_rbg.shape[2],
+    )
+
+    if tuple(rank1_rbg_score.shape) != expected_score_shape:
+        raise ValueError(
+            "rank1_rbg_score must have shape "
+            "[batch, UE, RBG]."
+        )
+
+    if tuple(rank2_rbg_score.shape) != expected_score_shape:
+        raise ValueError(
+            "rank2_rbg_score must have shape "
+            "[batch, UE, RBG]."
+        )
+
+    if rank1_rbg_score.device != h_serving_rbg.device:
+        raise ValueError(
+            "rank1_rbg_score and h_serving_rbg "
+            "must be on the same device."
+        )
+
+    if rank2_rbg_score.device != h_serving_rbg.device:
+        raise ValueError(
+            "rank2_rbg_score and h_serving_rbg "
+            "must be on the same device."
+        )
+
+    num_ofdm_symbols = (
+        h_serving_rbg.shape[3]
+    )
+
+    subcarriers_per_rbg = (
+        h_serving_rbg.shape[4]
+    )
+
+    if num_ofdm_symbols <= 0:
+        raise ValueError(
+            "At least one OFDM symbol is required."
+        )
+
+    if subcarriers_per_rbg <= 0:
+        raise ValueError(
+            "At least one subcarrier per RBG is required."
+        )
+
+    csi_subcarrier_index = (
+        subcarriers_per_rbg // 2
+    )
+
+    csi_snapshot = h_serving_rbg[
+        :,
+        :,
+        :,
+        0,
+        csi_subcarrier_index,
+        :,
+        :,
+    ]
+
+    u, singular_values_all, vh = torch.linalg.svd(
+        csi_snapshot,
+        full_matrices=False,
+    )
+
+    singular_values = (
+        singular_values_all[..., :2]
+    )
+
+    rx_combiners = (
+        u[
+            ...,
+            :,
+            :2,
+        ]
+        .movedim(
+            -1,
+            -2,
+        )
+        .contiguous()
+    )
+
+    precoder_directions = (
+        vh[..., :2, :]
+        .conj()
+        .contiguous()
+    )
+
+    effective_channels = torch.einsum(
+        "...lr,...rt->...lt",
+        rx_combiners.conj(),
+        csi_snapshot,
+    )
+
+    rank1_wideband_score = (
+        rank1_rbg_score.sum(
+            dim=-1
+        )
+    )
+
+    rank2_wideband_score = (
+        rank2_rbg_score.sum(
+            dim=-1
+        )
+    )
+
+    recommended_rank = torch.where(
+        rank2_wideband_score
+        > rank1_wideband_score,
+        torch.full_like(
+            rank1_wideband_score,
+            fill_value=2,
+            dtype=torch.long,
+        ),
+        torch.full_like(
+            rank1_wideband_score,
+            fill_value=1,
+            dtype=torch.long,
+        ),
+    )
+
+    layer_numbers = torch.arange(
+        1,
+        3,
+        dtype=torch.long,
+        device=h_serving_rbg.device,
+    )
+
+    wideband_layer_mask = (
+        layer_numbers
+        <= recommended_rank.unsqueeze(-1)
+    )
+
+    layer_valid_mask = (
+        wideband_layer_mask
+        .unsqueeze(2)
+        .expand(
+            -1,
+            -1,
+            h_serving_rbg.shape[2],
+            -1,
+        )
+    )
+
+    return IdealSVDCSIData(
+        csi_snapshot=csi_snapshot,
+        recommended_rank=recommended_rank,
+        singular_values=singular_values,
+        rx_combiners=rx_combiners,
+        precoder_directions=(
+            precoder_directions
+        ),
+        effective_channels=(
+            effective_channels
+        ),
+        layer_valid_mask=(
+            layer_valid_mask
+        ),
+        csi_subcarrier_index=(
+            csi_subcarrier_index
+        ),
+    )
+
+
 def extract_serving_mimo_rbg_channel(
     h_freq: torch.Tensor,
     serving_bs: torch.Tensor,
