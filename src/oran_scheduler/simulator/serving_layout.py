@@ -364,3 +364,131 @@ def gather_candidate_ue_values(
         torch.zeros_like(candidate_values),
     )
 
+def gather_serving_ue_rbg_values(
+    global_ue_rbg_values: torch.Tensor,
+    serving_data: ServingCellData,
+) -> torch.Tensor:
+    """
+    Convert a global per-UE/per-RBG tensor into the padded
+    serving-cell scheduler layout.
+
+    Args:
+        global_ue_rbg_values:
+            [batch, global_UE, RBG]
+
+        serving_data:
+            Existing serving-cell layout containing the mapping
+            from padded local UE slots to global UE indices.
+
+    Returns:
+        [batch, cell, padded_UE, RBG]
+
+    Invalid padded UE slots are filled with zero.
+
+    The input may represent achievable rate, SINR, CQI-derived
+    values, or any other per-UE/per-RBG quantity.
+    """
+    if global_ue_rbg_values.ndim != 3:
+        raise ValueError(
+            "global_ue_rbg_values must have shape "
+            "[batch, global_UE, RBG]."
+        )
+
+    if serving_data.global_ue_indices.ndim != 3:
+        raise ValueError(
+            "serving_data.global_ue_indices must have shape "
+            "[batch, cell, padded_UE]."
+        )
+
+    if (
+        global_ue_rbg_values.shape[0]
+        != serving_data.global_ue_indices.shape[0]
+    ):
+        raise ValueError(
+            "Batch dimensions must match."
+        )
+
+    if (
+        global_ue_rbg_values.device
+        != serving_data.global_ue_indices.device
+    ):
+        raise ValueError(
+            "global_ue_rbg_values and serving_data "
+            "must be on the same device."
+        )
+
+    safe_global_indices = torch.where(
+        serving_data.valid_ue_mask,
+        serving_data.global_ue_indices,
+        torch.zeros_like(
+            serving_data.global_ue_indices
+        ),
+    )
+
+    valid_global_indices = (
+        serving_data.global_ue_indices[
+            serving_data.valid_ue_mask
+        ]
+    )
+
+    if valid_global_indices.numel() > 0:
+        if torch.any(valid_global_indices < 0):
+            raise ValueError(
+                "Valid serving slots contain negative "
+                "global UE indices."
+            )
+
+        if torch.any(
+            valid_global_indices
+            >= global_ue_rbg_values.shape[1]
+        ):
+            raise ValueError(
+                "Serving layout contains a global UE index "
+                "outside global_ue_rbg_values."
+            )
+
+    num_rbgs = (
+        global_ue_rbg_values.shape[-1]
+    )
+
+    gather_indices = (
+        safe_global_indices
+        .unsqueeze(-1)
+        .expand(
+            -1,
+            -1,
+            -1,
+            num_rbgs,
+        )
+    )
+
+    num_cells = (
+        serving_data.global_ue_indices.shape[1]
+    )
+
+    expanded_global_values = (
+        global_ue_rbg_values
+        .unsqueeze(1)
+        .expand(
+            -1,
+            num_cells,
+            -1,
+            -1,
+        )
+    )
+
+    serving_values = torch.gather(
+        expanded_global_values,
+        dim=2,
+        index=gather_indices,
+    )
+
+    return torch.where(
+        serving_data.valid_ue_mask.unsqueeze(-1),
+        serving_values,
+        torch.zeros_like(
+            serving_values
+        ),
+    )
+
+

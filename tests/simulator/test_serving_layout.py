@@ -7,7 +7,9 @@ from oran_scheduler.simulator.rbg import (
     RBGChannelData,
 )
 from oran_scheduler.simulator.serving_layout import (
+    ServingCellData,
     build_serving_cell_data,
+    gather_serving_ue_rbg_values,
 )
 
 def test_variable_size_serving_layout():
@@ -140,4 +142,176 @@ def test_variable_size_serving_layout():
         expected,
     )
 
-    
+def test_gather_serving_ue_rbg_values():
+    device = "cuda:0"
+
+    global_values = torch.tensor(
+        [
+            [
+                [10.0, 11.0],
+                [20.0, 21.0],
+                [30.0, 31.0],
+                [40.0, 41.0],
+            ]
+        ],
+        device=device,
+    )
+    serving_data = ServingCellData(
+        power=torch.zeros(
+            1,
+            2,
+            3,
+            2,
+            device=device,
+        ),
+        global_ue_indices=torch.tensor(
+            [
+                [
+                    [2, 0, -1],
+                    [3, 1, -1],
+                ]
+            ],
+            dtype=torch.long,
+            device=device,
+        ),
+        valid_ue_mask=torch.tensor(
+            [
+                [
+                    [True, True, False],
+                    [True, True, False],
+                ]
+            ],
+            dtype=torch.bool,
+            device=device,
+        ),
+        num_ues_per_cell=torch.tensor(
+            [
+                [2, 2]
+            ],
+            dtype=torch.long,
+            device=device,
+        ),
+    )
+
+    serving_values = (
+        gather_serving_ue_rbg_values(
+            global_ue_rbg_values=global_values,
+            serving_data=serving_data,
+        )
+    )
+
+    assert serving_values.shape == (
+        1,
+        2,
+        3,
+        2,
+    )
+
+    expected_cell_0 = torch.tensor(
+        [
+            [30.0, 31.0],
+            [10.0, 11.0],
+            [0.0, 0.0],
+        ],
+        device=device,
+    )
+
+    expected_cell_1 = torch.tensor(
+        [
+            [40.0, 41.0],
+            [20.0, 21.0],
+            [0.0, 0.0],
+        ],
+        device=device,
+    )
+
+    torch.testing.assert_close(
+        serving_values[
+            0,
+            0,
+            :,
+            :,
+        ],
+        expected_cell_0,
+    )
+
+    torch.testing.assert_close(
+        serving_values[
+            0,
+            1,
+            :,
+            :,
+        ],
+        expected_cell_1,
+    )
+
+def test_gather_serving_ue_rbg_values_zeroes_padding():
+    device = "cuda:0"
+
+    global_values = torch.full(
+        (
+            1,
+            2,
+            3,
+        ),
+        fill_value=9999.0,
+        device=device,
+    )
+
+    serving_data = ServingCellData(
+        power=torch.zeros(
+            1,
+            1,
+            2,
+            3,
+            device=device,
+        ),
+        global_ue_indices=torch.tensor(
+            [
+                [
+                    [1, -1]
+                ]
+            ],
+            dtype=torch.long,
+            device=device,
+        ),
+        valid_ue_mask=torch.tensor(
+            [
+                [
+                    [True, False]
+                ]
+            ],
+            dtype=torch.bool,
+            device=device,
+        ),
+        num_ues_per_cell=torch.tensor(
+            [
+                [1]
+            ],
+            dtype=torch.long,
+            device=device,
+        ),
+    )
+
+    serving_values = (
+        gather_serving_ue_rbg_values(
+            global_ue_rbg_values=global_values,
+            serving_data=serving_data,
+        )
+    )
+
+    assert torch.all(
+        serving_values[
+            0,
+            0,
+            1,
+            :,
+        ]
+        == 0.0
+    )
+
+
+
+
+
+      

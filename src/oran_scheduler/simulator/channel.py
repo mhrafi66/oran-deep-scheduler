@@ -20,6 +20,7 @@ class ChannelConfig:
     num_rbs: int = 18
     subcarriers_per_rb: int = 12
     num_ofdm_symbols: int = 1
+    antenna_mode: str = "sanity"
     direction: str = "downlink"
     # Outdoor-to-indoor penetration-loss model required by Sionna UMa.
     #
@@ -97,6 +98,85 @@ def create_sanity_arrays(
 
     return bs_array, ut_array
 
+def create_paper_arrays(
+    config: ChannelConfig,
+) -> tuple[PanelArray, PanelArray]:
+    """
+    Create the antenna arrays used for the paper-aligned MIMO path.
+
+    Paper:
+        gNB panel:
+            12 x 8 physical elements,
+            two polarizations.
+
+        UE:
+            2 dual-polarized Rx antennas.
+
+        Maximum UE rank:
+            2.
+
+    Open-reproduction interpretation:
+        - Sionna dual polarization creates two antenna ports
+          per physical element.
+        - Therefore the gNB has 12 * 8 * 2 = 192 ports.
+        - We represent the UE as 1 x 2 physical elements with
+          dual polarization, giving 4 receive ports.
+        - Maximum rank 2 will be enforced separately.
+        - Polarization type "VH" is an implementation choice.
+        - UE uses the omni element pattern.
+        - Element spacings use Sionna defaults because the paper
+          does not publicly specify them.
+    """
+    bs_array = PanelArray(
+        num_rows_per_panel=12,
+        num_cols_per_panel=8,
+        polarization="dual",
+        polarization_type="VH",
+        antenna_pattern="38.901",
+        carrier_frequency=(
+            config.carrier_frequency_hz
+        ),
+        precision=config.precision,
+        device=config.device,
+    )
+
+    ut_array = PanelArray(
+        num_rows_per_panel=1,
+        num_cols_per_panel=2,
+        polarization="dual",
+        polarization_type="VH",
+        antenna_pattern="omni",
+        carrier_frequency=(
+            config.carrier_frequency_hz
+        ),
+        precision=config.precision,
+        device=config.device,
+    )
+
+    return bs_array, ut_array
+
+def create_channel_arrays(
+    config: ChannelConfig,
+) -> tuple[PanelArray, PanelArray]:
+    """
+    Create channel arrays for the selected PHY configuration.
+    """
+
+    if config.antenna_mode == "sanity":
+        return create_sanity_arrays(
+            config
+        )
+
+    if config.antenna_mode == "paper":
+        return create_paper_arrays(
+            config
+        )
+
+    raise ValueError(
+        "Unsupported antenna_mode. "
+        "Expected 'sanity' or 'paper', "
+        f"got {config.antenna_mode!r}."
+    )
 
 def create_training_resource_grid(
         config: ChannelConfig,
@@ -167,7 +247,9 @@ def generate_frequency_channel(
     """
     set_channel_seed(channel_config.seed)
 
-    bs_array, ut_array = create_sanity_arrays(channel_config)
+    bs_array, ut_array = create_channel_arrays(
+        channel_config
+    )
 
     resource_grid = create_training_resource_grid(channel_config)
 
