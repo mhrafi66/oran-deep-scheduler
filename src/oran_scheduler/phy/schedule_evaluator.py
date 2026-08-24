@@ -70,6 +70,420 @@ class CellAllocationEvaluationData:
 
     rzf_alpha_by_rbg: torch.Tensor
 
+
+@dataclass
+class RBGAllocationEvaluationData:
+    """
+    Physical evaluation of one selected candidate set
+    on one RBG.
+
+    selected_candidate_indices:
+        [scheduled_UE]
+
+    selected_global_ue_indices:
+        [scheduled_UE]
+
+    selected_ranks:
+        [scheduled_UE]
+
+    nominal_rate_bps:
+        [scheduled_UE]
+
+    expected_goodput_bps:
+        [scheduled_UE]
+
+    target_compliant_rate_bps:
+        [scheduled_UE]
+
+    total_target_compliant_rate_bps:
+        scalar
+
+    num_scheduled_ues:
+        Number of spatially co-scheduled UEs.
+
+    num_physical_layers:
+        Sum of the selected UE ranks.
+
+    rzf_alpha:
+        RZF regularization value used for this RBG.
+    """
+
+    selected_candidate_indices: torch.Tensor
+    selected_global_ue_indices: torch.Tensor
+    selected_ranks: torch.Tensor
+
+    nominal_rate_bps: torch.Tensor
+    expected_goodput_bps: torch.Tensor
+    target_compliant_rate_bps: torch.Tensor
+
+    total_target_compliant_rate_bps: torch.Tensor
+
+    num_scheduled_ues: int
+    num_physical_layers: int
+
+    rzf_alpha: float
+
+def evaluate_rbg_candidate_set(
+    selected_candidate_indices: torch.Tensor,
+    candidate_global_ue_indices: torch.Tensor,
+    h_freq: torch.Tensor,
+    serving_cell_index: int,
+    recommended_rank: torch.Tensor,
+    rx_combiners: torch.Tensor,
+    rbg_index: int,
+    csi_subcarrier_index: int,
+    subcarriers_per_rbg: int,
+    tx_power_per_subcarrier_w: float | torch.Tensor,
+    noise_power_per_subcarrier_w: float | torch.Tensor,
+    link_adaptation_config: LinkAdaptationConfig,
+    rate_config: RateConfig,
+    batch_index: int = 0,
+) -> RBGAllocationEvaluationData:
+    """
+    Evaluate one hypothetical candidate set on one RBG.
+
+    selected_candidate_indices contains positions in the
+    PF-TDS candidate list, NOT global UE IDs.
+
+    This function is intentionally scheduler-agnostic.
+    Baseline SDS, PF-Greedy SDS, or an RL policy can all
+    call the same PHY evaluator.
+    """
+
+    if selected_candidate_indices.ndim != 1:
+        raise ValueError(
+            "selected_candidate_indices must have shape "
+            "[scheduled_UE]."
+        )
+
+    if candidate_global_ue_indices.ndim != 1:
+        raise ValueError(
+            "candidate_global_ue_indices must have shape "
+            "[candidate]."
+        )
+
+    if h_freq.ndim != 7:
+        raise ValueError(
+            "h_freq must have seven dimensions."
+        )
+
+    num_candidates = int(
+        candidate_global_ue_indices.numel()
+    )
+
+    if torch.any(
+        selected_candidate_indices < 0
+    ):
+        raise ValueError(
+            "selected_candidate_indices cannot be negative."
+        )
+
+    if torch.any(
+        selected_candidate_indices >= num_candidates
+    ):
+        raise ValueError(
+            "selected_candidate_indices contains "
+            "an invalid candidate."
+        )
+
+    if (
+        torch.unique(
+            selected_candidate_indices
+        ).numel()
+        != selected_candidate_indices.numel()
+    ):
+        raise ValueError(
+            "The same candidate cannot appear twice "
+            "on one RBG."
+        )
+
+
+    num_subcarriers = (
+        h_freq.shape[-1]
+    )
+
+    if (
+        num_subcarriers
+        % subcarriers_per_rbg
+        != 0
+    ):
+        raise ValueError(
+            "Subcarrier count is not divisible by "
+            "subcarriers_per_rbg."
+        )
+
+    num_rbgs = (
+        num_subcarriers
+        // subcarriers_per_rbg
+    )
+
+    if not (
+        0 <= rbg_index < num_rbgs
+    ):
+        raise ValueError(
+            "rbg_index is invalid."
+        )
+
+    if not (
+        0 <= batch_index < h_freq.shape[0]
+    ):
+        raise ValueError(
+            "batch_index is invalid."
+        )
+
+
+    real_dtype = (
+        h_freq.real.dtype
+    )
+
+    device = (
+        h_freq.device
+    )
+
+    if selected_candidate_indices.numel() == 0:
+
+        empty_long = torch.empty(
+            0,
+            dtype=torch.long,
+            device=device,
+        )
+
+        empty_real = torch.empty(
+            0,
+            dtype=real_dtype,
+            device=device,
+        )
+
+        zero_rate = torch.zeros(
+            (),
+            dtype=real_dtype,
+            device=device,
+        )
+
+        return RBGAllocationEvaluationData(
+            selected_candidate_indices=(
+                empty_long
+            ),
+            selected_global_ue_indices=(
+                empty_long
+            ),
+            selected_ranks=(
+                empty_long
+            ),
+            nominal_rate_bps=(
+                empty_real
+            ),
+            expected_goodput_bps=(
+                empty_real
+            ),
+            target_compliant_rate_bps=(
+                empty_real
+            ),
+            total_target_compliant_rate_bps=(
+                zero_rate
+            ),
+            num_scheduled_ues=0,
+            num_physical_layers=0,
+            rzf_alpha=0.0,
+        )
+
+    selected_global_ues = (
+        candidate_global_ue_indices[
+            selected_candidate_indices
+        ]
+    )
+
+    selected_ranks = (
+        recommended_rank[
+            batch_index,
+            selected_global_ues,
+        ]
+    )
+
+    selected_rx_combiners = (
+        rx_combiners[
+            batch_index,
+            selected_global_ues,
+            rbg_index,
+            :,
+            :,
+        ]
+    )
+
+    first_subcarrier = (
+        rbg_index
+        * subcarriers_per_rbg
+    )
+
+    last_subcarrier = (
+        first_subcarrier
+        + subcarriers_per_rbg
+    )
+
+    selected_all_bs_channel = (
+        h_freq[
+            batch_index,
+            selected_global_ues,
+            :,
+            :,
+            :,
+            :,
+            first_subcarrier:last_subcarrier,
+        ]
+    )
+
+
+    selected_all_bs_channel = (
+        selected_all_bs_channel
+        .permute(
+            0,
+            4,
+            5,
+            2,
+            1,
+            3,
+        )
+        .contiguous()
+    )
+
+
+    inter_cell_covariance = (
+        compute_isotropic_inter_cell_covariance(
+            all_bs_channel=(
+                selected_all_bs_channel
+            ),
+            serving_cell_index=(
+                serving_cell_index
+            ),
+            tx_power_per_subcarrier_w=(
+                tx_power_per_subcarrier_w
+            ),
+        )
+    )
+
+
+    selected_serving_channel = (
+        selected_all_bs_channel[
+            :,
+            :,
+            :,
+            serving_cell_index,
+            :,
+            :,
+        ]
+    )
+
+
+    rzf_alpha = estimate_rzf_alpha(
+        selected_ranks=selected_ranks,
+        selected_rx_combiners=(
+            selected_rx_combiners
+        ),
+        inter_cell_covariance=(
+            inter_cell_covariance
+        ),
+        total_tx_power_w=(
+            tx_power_per_subcarrier_w
+        ),
+        noise_power_w=(
+            noise_power_per_subcarrier_w
+        ),
+    )
+
+    rbg_phy_data = (
+        evaluate_selected_users_on_rbg(
+            selected_ue_channel=(
+                selected_serving_channel
+            ),
+            selected_ranks=(
+                selected_ranks
+            ),
+            selected_rx_combiners=(
+                selected_rx_combiners
+            ),
+            total_tx_power_w=(
+                tx_power_per_subcarrier_w
+            ),
+            noise_power_w=(
+                noise_power_per_subcarrier_w
+            ),
+            rzf_alpha=rzf_alpha,
+            csi_subcarrier_index=(
+                csi_subcarrier_index
+            ),
+            inter_cell_covariance=(
+                inter_cell_covariance
+            ),
+        )
+    )
+
+    rate_data = (
+        compute_mu_mimo_rbg_rates(
+            layer_sinr_linear=(
+                rbg_phy_data
+                .sinr_data
+                .sinr_linear
+            ),
+            layer_ue_indices=(
+                rbg_phy_data
+                .layer_ue_indices
+            ),
+            layer_index_within_ue=(
+                rbg_phy_data
+                .layer_index_within_ue
+            ),
+            selected_ranks=(
+                selected_ranks
+            ),
+            link_adaptation_config=(
+                link_adaptation_config
+            ),
+            rate_config=(
+                rate_config
+            ),
+        )
+    )
+
+    return RBGAllocationEvaluationData(
+        selected_candidate_indices=(
+            selected_candidate_indices
+        ),
+        selected_global_ue_indices=(
+            selected_global_ues
+        ),
+        selected_ranks=(
+            selected_ranks
+        ),
+        nominal_rate_bps=(
+            rate_data.ue_rate_bps
+        ),
+        expected_goodput_bps=(
+            rate_data
+            .expected_ue_goodput_bps
+        ),
+        target_compliant_rate_bps=(
+            rate_data
+            .target_compliant_ue_rate_bps
+        ),
+        total_target_compliant_rate_bps=(
+            rate_data
+            .total_target_compliant_rate_bps
+        ),
+        num_scheduled_ues=int(
+            selected_global_ues.numel()
+        ),
+        num_physical_layers=int(
+            selected_ranks.sum().item()
+        ),
+        rzf_alpha=rzf_alpha,
+    )
+
+
+
+
+
+
+
 def estimate_rzf_alpha(
     selected_ranks: torch.Tensor,
     selected_rx_combiners: torch.Tensor,
