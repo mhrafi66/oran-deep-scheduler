@@ -6,6 +6,10 @@ from oran_scheduler.phy.mu_mimo import (
     compute_rzf_matrix,
 )
 
+from oran_scheduler.phy.mu_mimo import (
+    compute_mu_mimo_layer_sinr,
+)
+
 def test_build_rank1_effective_channel():
     device = "cuda:0"
 
@@ -180,4 +184,257 @@ def test_mrc_combining_gain():
         result.sinr_linear,
         expected_sinr,
     )
+
+
+
+def test_general_mu_mimo_single_layer():
+    device = "cuda:0"
+
+    h = torch.tensor(
+        [
+            [
+                [1.0, 0.0],
+                [2.0, 0.0],
+            ]
+        ],
+        dtype=torch.complex64,
+        device=device,
+    )
+
+    combiner = torch.tensor(
+        [
+            [1.0, 2.0]
+        ],
+        dtype=torch.complex64,
+        device=device,
+    )
+
+    result = compute_mu_mimo_layer_sinr(
+        layer_physical_channel=h,
+        layer_rx_combiner=combiner,
+        total_tx_power_w=1.0,
+        noise_power_w=1.0,
+        rzf_alpha=0.0,
+    )
+    assert result.precoding_matrix.shape == (
+        2,
+        1,
+    )
+
+    assert result.combined_channel.shape == (
+        1,
+        1,
+    )
+
+    torch.testing.assert_close(
+        result.intra_cell_interference_power,
+        torch.zeros_like(
+            result.intra_cell_interference_power
+        ),
+        atol=1.0e-6,
+        rtol=1.0e-6,
+    )
+
+    assert torch.all(
+        result.sinr_linear > 0
+    )
+
+def test_two_orthogonal_layers_have_zero_intra_cell_interference():
+    device = "cuda:0"
+
+    h = torch.tensor(
+        [
+            [
+                [1.0, 0.0]
+            ],
+            [
+                [0.0, 1.0]
+            ],
+        ],
+        dtype=torch.complex64,
+        device=device,
+    )
+
+    combiner = torch.ones(
+        (
+            2,
+            1,
+        ),
+        dtype=torch.complex64,
+        device=device,
+    )
+
+    result = compute_mu_mimo_layer_sinr(
+        layer_physical_channel=h,
+        layer_rx_combiner=combiner,
+        total_tx_power_w=2.0,
+        noise_power_w=1.0,
+        rzf_alpha=0.0,
+    )
+
+    expected_stream_power = torch.tensor(
+        [1.0, 1.0],
+        device=device,
+    )
+
+    torch.testing.assert_close(
+        result.stream_power_w,
+        expected_stream_power,
+    )
+
+    torch.testing.assert_close(
+        result.intra_cell_interference_power,
+        torch.zeros_like(
+            result.intra_cell_interference_power
+        ),
+        atol=1.0e-6,
+        rtol=1.0e-6,
+    )
+
+    expected_desired = torch.tensor(
+        [1.0, 1.0],
+        device=device,
+    )
+
+    torch.testing.assert_close(
+        result.desired_power,
+        expected_desired,
+        atol=1.0e-5,
+        rtol=1.0e-5,
+    )
+
+    expected_sinr = torch.tensor(
+        [1.0, 1.0],
+        device=device,
+    )
+
+    torch.testing.assert_close(
+        result.sinr_linear,
+        expected_sinr,
+        atol=1.0e-5,
+        rtol=1.0e-5,
+    )
+
+def test_two_layers_can_belong_to_same_physical_ue():
+    device = "cuda:0"
+
+    physical_channel = torch.tensor(
+        [
+            [2.0, 0.0],
+            [0.0, 1.0],
+        ],
+        dtype=torch.complex64,
+        device=device,
+    )
+
+    h = torch.stack(
+        [
+            physical_channel,
+            physical_channel,
+        ],
+        dim=0,
+    )
+
+    combiner = torch.tensor(
+        [
+            [1.0, 0.0],
+            [0.0, 1.0],
+        ],
+        dtype=torch.complex64,
+        device=device,
+    )
+
+    result = compute_mu_mimo_layer_sinr(
+        layer_physical_channel=h,
+        layer_rx_combiner=combiner,
+        total_tx_power_w=2.0,
+        noise_power_w=1.0,
+        rzf_alpha=0.0,
+    )
+
+    assert result.effective_channel.shape == (
+        2,
+        2,
+    )
+
+    assert result.precoding_matrix.shape == (
+        2,
+        2,
+    )
+
+    torch.testing.assert_close(
+        result.intra_cell_interference_power,
+        torch.zeros_like(
+            result.intra_cell_interference_power
+        ),
+        atol=1.0e-6,
+        rtol=1.0e-6,
+    )
+
+def test_mu_mimo_inter_cell_covariance():
+    device = "cuda:0"
+
+    h = torch.tensor(
+        [
+            [
+                [1.0, 0.0],
+                [0.0, 1.0],
+            ]
+        ],
+        dtype=torch.complex64,
+        device=device,
+    )
+
+    combiner = torch.tensor(
+        [
+            [1.0, 0.0]
+        ],
+        dtype=torch.complex64,
+        device=device,
+    )
+
+    inter_cell_covariance = torch.tensor(
+        [
+            [
+                [3.0, 0.0],
+                [0.0, 5.0],
+            ]
+        ],
+        dtype=torch.complex64,
+        device=device,
+    )
+
+    result = compute_mu_mimo_layer_sinr(
+        layer_physical_channel=h,
+        layer_rx_combiner=combiner,
+        total_tx_power_w=1.0,
+        noise_power_w=1.0,
+        rzf_alpha=0.0,
+        inter_cell_covariance=(
+            inter_cell_covariance
+        ),
+    )
+
+    expected_interference = torch.tensor(
+        [3.0],
+        device=device,
+    )
+
+    torch.testing.assert_close(
+        result.inter_cell_interference_power,
+        expected_interference,
+    )
+
+    expected_sinr = torch.tensor(
+        [0.25],
+        device=device,
+    )
+
+    torch.testing.assert_close(
+        result.sinr_linear,
+        expected_sinr,
+        atol=1.0e-5,
+        rtol=1.0e-5,
+    )
+
 
