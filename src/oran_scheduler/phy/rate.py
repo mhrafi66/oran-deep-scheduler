@@ -68,6 +68,7 @@ def validate_rate_input(
     mcs_index: torch.Tensor,
     tbler: torch.Tensor,
     config: RateConfig,
+    num_streams_per_ue: torch.Tensor | None = None,
 ) -> None:
     """
     Validate per-RBG MCS and TBLER tensors.
@@ -131,11 +132,41 @@ def validate_rate_input(
         raise ValueError(
             "slot_duration_s must be positive."
         )
+    if num_streams_per_ue is not None:
+
+        if (
+            num_streams_per_ue.shape
+            != mcs_index.shape
+        ):
+            raise ValueError(
+                "num_streams_per_ue must have the same "
+                "shape as mcs_index."
+            )
+
+        if (
+            num_streams_per_ue.device
+            != mcs_index.device
+        ):
+            raise ValueError(
+                "num_streams_per_ue and mcs_index must "
+                "be on the same device."
+            )
+
+        if torch.any(
+            num_streams_per_ue <= 0
+        ):
+            raise ValueError(
+                "Every UE must have at least one stream."
+            )
+
+
+    
 
 def compute_rbg_rates(
     mcs_index: torch.Tensor,
     tbler: torch.Tensor,
     config: RateConfig,
+    num_streams_per_ue: torch.Tensor | None = None,
 ) -> RateData:
     """
     Convert per-RBG MCS and TBLER into deterministic rate estimates.
@@ -153,6 +184,9 @@ def compute_rbg_rates(
         mcs_index=mcs_index,
         tbler=tbler,
         config=config,
+        num_streams_per_ue=(
+            num_streams_per_ue
+        ),
     )
 
     is_pusch = (
@@ -169,10 +203,28 @@ def compute_rbg_rates(
         device=config.device,
     )
 
+    if num_streams_per_ue is None:
+
+        stream_count = torch.full_like(
+            mcs_index,
+            fill_value=(
+                config.num_streams_per_ue
+            ),
+            dtype=torch.int32,
+        )
+
+    else:
+
+        stream_count = (
+            num_streams_per_ue.to(
+                dtype=torch.int32
+            )
+        )
+
     num_allocated_re = (
         config.num_slot_ofdm_symbols
         * config.subcarriers_per_rbg
-        * config.num_streams_per_ue
+        * stream_count
     )
 
     num_coded_bits = (
