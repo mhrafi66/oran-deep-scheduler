@@ -395,6 +395,295 @@ def compute_mu_mimo_layer_sinr(
     )
 
 
+def evaluate_mu_mimo_layer_sinr_with_precoder(
+    layer_physical_channel: torch.Tensor,
+    layer_rx_combiner: torch.Tensor,
+    precoding_matrix: torch.Tensor,
+    total_tx_power_w: float | torch.Tensor,
+    noise_power_w: float | torch.Tensor,
+    inter_cell_covariance: torch.Tensor | None = None,
+) -> MUMIMOLayerSINRData:
+    """
+    Evaluate a FIXED MU-MIMO precoder over one or more
+    physical channel realizations.
+
+    Args:
+        layer_physical_channel:
+            [..., layer, RX_ant, TX_ant]
+
+            Leading dimensions may represent OFDM symbols,
+            subcarriers, or both.
+
+        layer_rx_combiner:
+            [layer, RX_ant]
+
+            One fixed receive direction per layer.
+
+        precoding_matrix:
+            [TX_ant, layer]
+
+            One fixed precoder, typically computed from a
+            representative CSI snapshot for the RBG.
+
+        total_tx_power_w:
+            Total BS transmit power available on each
+            evaluated subcarrier.
+
+        noise_power_w:
+            Noise power per physical RX branch.
+
+        inter_cell_covariance:
+            Optional:
+                [..., layer, RX_ant, RX_ant]
+
+    Important:
+        This function does NOT recompute RZF.
+
+        It evaluates one already-chosen precoder on the
+        actual frequency-selective channel.
+    """
+
+    if layer_physical_channel.ndim < 3:
+        raise ValueError(
+            "layer_physical_channel must end with "
+            "[layer, RX_ant, TX_ant]."
+        )
+
+    if not torch.is_complex(
+        layer_physical_channel
+    ):
+        raise ValueError(
+            "layer_physical_channel must be complex-valued."
+        )
+
+    num_layers = (
+        layer_physical_channel.shape[-3]
+    )
+
+    num_rx_ant = (
+        layer_physical_channel.shape[-2]
+    )
+
+    num_tx_ant = (
+        layer_physical_channel.shape[-1]
+    )
+
+    if tuple(
+        layer_rx_combiner.shape
+    ) != (
+        num_layers,
+        num_rx_ant,
+    ):
+        raise ValueError(
+            "layer_rx_combiner must have shape "
+            "[layer, RX_ant]."
+        )
+
+    if tuple(
+        precoding_matrix.shape
+    ) != (
+        num_tx_ant,
+        num_layers,
+    ):
+        raise ValueError(
+            "precoding_matrix must have shape "
+            "[TX_ant, layer]."
+        )
+
+    if not torch.is_complex(
+        layer_rx_combiner
+    ):
+        raise ValueError(
+            "layer_rx_combiner must be complex-valued."
+        )
+
+    if not torch.is_complex(
+        precoding_matrix
+    ):
+        raise ValueError(
+            "precoding_matrix must be complex-valued."
+        )
+
+    combiner_norm = torch.linalg.vector_norm(
+        layer_rx_combiner,
+        dim=-1,
+        keepdim=True,
+    )
+
+    if torch.any(combiner_norm <= 0):
+        raise ValueError(
+            "A receive combiner has zero norm."
+        )
+
+    normalized_combiner = (
+        layer_rx_combiner
+        / combiner_norm
+    )
+
+    effective_channel = torch.einsum(
+        "lr,...lrt->...lt",
+        normalized_combiner.conj(),
+        layer_physical_channel,
+    )
+
+    precoded_spatial_channel = torch.matmul(
+        layer_physical_channel,
+        precoding_matrix,
+    )
+
+    combined_channel = torch.einsum(
+        "lr,...lrj->...lj",
+        normalized_combiner.conj(),
+        precoded_spatial_channel,
+    )
+
+    total_tx_power = torch.as_tensor(
+        total_tx_power_w,
+        dtype=layer_physical_channel.real.dtype,
+        device=layer_physical_channel.device,
+    )
+
+    if torch.any(total_tx_power <= 0):
+        raise ValueError(
+            "total_tx_power_w must be positive."
+        )
+
+    leading_shape = (
+        layer_physical_channel.shape[:-3]
+    )
+
+    stream_power_shape = (
+        leading_shape
+        + (num_layers,)
+    )
+
+    per_layer_power = (
+        total_tx_power
+        / float(num_layers)
+    )
+
+    stream_power_w = torch.broadcast_to(
+        per_layer_power,
+        stream_power_shape,
+    )
+
+    combined_power = (
+        torch.abs(
+            combined_channel
+        ) ** 2
+    )
+
+    combined_power = (
+        combined_power
+        * stream_power_w.unsqueeze(-2)
+    )
+
+    desired_power = torch.diagonal(
+        combined_power,
+        dim1=-2,
+        dim2=-1,
+    )
+
+    total_serving_power = (
+        combined_power.sum(
+            dim=-1
+        )
+    )
+
+    intra_cell_interference_power = (
+        total_serving_power
+        - desired_power
+    )
+
+    noise_power = torch.as_tensor(
+        noise_power_w,
+        dtype=layer_physical_channel.real.dtype,
+        device=layer_physical_channel.device,
+    )
+
+    if torch.any(noise_power < 0):
+        raise ValueError(
+            "noise_power_w cannot be negative."
+        )
+
+    noise_power = torch.broadcast_to(
+        noise_power,
+        stream_power_shape,
+    )
+
+    if inter_cell_covariance is None:
+        inter_cell_interference_power = (
+            torch.zeros_like(
+                desired_power
+            )
+        )
+
+    else:
+        expected_covariance_shape = (
+            layer_physical_channel.shape[:-1]
+            + (num_rx_ant,)
+        )
+
+        if tuple(
+            inter_cell_covariance.shape
+        ) != tuple(
+            expected_covariance_shape
+        ):
+            raise ValueError(
+                "inter_cell_covariance must have shape "
+                "[..., layer, RX_ant, RX_ant]."
+            )
+
+        inter_cell_interference_power = (
+            torch.einsum(
+                "lr,...lrs,ls->...l",
+                normalized_combiner.conj(),
+                inter_cell_covariance,
+                normalized_combiner,
+            )
+            .real
+        )
+
+        inter_cell_interference_power = (
+            torch.clamp(
+                inter_cell_interference_power,
+                min=0.0,
+            )
+        )
+
+    denominator = (
+        intra_cell_interference_power
+        + inter_cell_interference_power
+        + noise_power
+    )
+
+    if torch.any(denominator <= 0):
+        raise ValueError(
+            "SINR denominator must be positive."
+        )
+
+    sinr_linear = (
+        desired_power
+        / denominator
+    )
+
+    return MUMIMOLayerSINRData(
+        effective_channel=effective_channel,
+        precoding_matrix=precoding_matrix,
+        combined_channel=combined_channel,
+        stream_power_w=stream_power_w,
+        desired_power=desired_power,
+        intra_cell_interference_power=(
+            intra_cell_interference_power
+        ),
+        inter_cell_interference_power=(
+            inter_cell_interference_power
+        ),
+        noise_power=noise_power,
+        sinr_linear=sinr_linear,
+    )
+
+
 
 
 

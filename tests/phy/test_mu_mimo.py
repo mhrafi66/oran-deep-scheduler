@@ -10,6 +10,10 @@ from oran_scheduler.phy.mu_mimo import (
     compute_mu_mimo_layer_sinr,
 )
 
+from oran_scheduler.phy.mu_mimo import (
+    evaluate_mu_mimo_layer_sinr_with_precoder,
+)
+
 def test_build_rank1_effective_channel():
     device = "cuda:0"
 
@@ -437,4 +441,99 @@ def test_mu_mimo_inter_cell_covariance():
         rtol=1.0e-5,
     )
 
+
+def test_fixed_precoder_over_multiple_subcarriers():
+    device = "cuda:0"
+
+    h = torch.zeros(
+        (
+            1,  # OFDM symbol
+            2,  # subcarrier
+            2,  # layer
+            1,  # RX antenna
+            2,  # TX antenna
+        ),
+        dtype=torch.complex64,
+        device=device,
+    )
+
+    h[
+        :,
+        :,
+        0,
+        0,
+        :,
+    ] = torch.tensor(
+        [1.0, 0.0],
+        dtype=torch.complex64,
+        device=device,
+    )
+
+    h[
+        :,
+        :,
+        1,
+        0,
+        :,
+    ] = torch.tensor(
+        [0.0, 1.0],
+        dtype=torch.complex64,
+        device=device,
+    )
+
+    combiner = torch.ones(
+        (
+            2,
+            1,
+        ),
+        dtype=torch.complex64,
+        device=device,
+    )
+
+    precoder = torch.eye(
+        2,
+        dtype=torch.complex64,
+        device=device,
+    )
+
+    result = (
+        evaluate_mu_mimo_layer_sinr_with_precoder(
+            layer_physical_channel=h,
+            layer_rx_combiner=combiner,
+            precoding_matrix=precoder,
+            total_tx_power_w=2.0,
+            noise_power_w=1.0,
+        )
+    )
+
+    assert result.sinr_linear.shape == (
+        1,
+        2,
+        2,
+    )
+
+    expected_sinr = torch.ones(
+        (
+            1,
+            2,
+            2,
+        ),
+        device=device,
+    )
+
+    torch.testing.assert_close(
+        result.sinr_linear,
+        expected_sinr,
+        atol=1.0e-5,
+        rtol=1.0e-5,
+    )
+
+    torch.testing.assert_close(
+        result.intra_cell_interference_power,
+        torch.zeros_like(
+            result.intra_cell_interference_power
+        ),
+        atol=1.0e-6,
+        rtol=1.0e-6,
+    )
 
