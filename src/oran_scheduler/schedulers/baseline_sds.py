@@ -108,6 +108,7 @@ def run_baseline_sds(
     num_candidates: int,
     score_rbg: RBGScoreFunction,
     config: BaselineSDSConfig,
+    candidate_valid_mask: torch.Tensor | None = None,
 ) -> BaselineSDSResult:
     """
     Run first-improvement spatial-domain scheduling.
@@ -152,6 +153,50 @@ def run_baseline_sds(
     )
 
     device = actions.device
+
+    if candidate_valid_mask is None:
+
+        valid_candidates = torch.ones(
+            num_candidates,
+            dtype=torch.bool,
+            device=device,
+        )
+
+    else:
+
+        if tuple(
+            candidate_valid_mask.shape
+        ) != (
+            num_candidates,
+        ):
+            raise ValueError(
+                "candidate_valid_mask must have "
+                "shape [candidate]."
+            )
+
+        valid_candidates = (
+            candidate_valid_mask.to(
+                device=device,
+                dtype=torch.bool,
+            )
+        )
+
+    initially_selected = actions[
+        actions != NO_ALLOCATION
+    ]
+
+    if (
+        initially_selected.numel() > 0
+        and torch.any(
+            ~valid_candidates[
+                initially_selected
+            ]
+        )
+    ):
+        raise ValueError(
+            "Initial FDS allocation contains "
+            "an invalid candidate slot."
+        )
 
     rbg_rate_bps = torch.zeros(
         allocation.num_rbgs,
@@ -212,7 +257,13 @@ def run_baseline_sds(
             for candidate_index in range(
                 num_candidates
             ):
-                
+
+                if not bool(
+                    valid_candidates[
+                        candidate_index
+                    ].item()
+                ):
+                    continue                
 
                 already_scheduled = torch.any(
                     current_candidates
