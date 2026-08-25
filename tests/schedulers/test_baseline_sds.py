@@ -220,3 +220,69 @@ def test_baseline_sds_stops_when_no_candidate_improves():
         expected,
     )
 
+def test_baseline_sds_skips_invalid_candidate_slots():
+    device = "cuda:0"
+
+    initial = CellAllocation(
+        candidate_by_user_slot=torch.tensor(
+            [
+                [0],
+                [-1],
+            ],
+            dtype=torch.long,
+            device=device,
+        )
+    )
+
+    candidate_valid_mask = torch.tensor(
+        [
+            True,
+            False,
+            True,
+        ],
+        dtype=torch.bool,
+        device=device,
+    )
+
+
+    rates = {
+        (0,): 10.0,
+        (0, 2): 12.0,
+    }
+
+    def score_rbg(
+        selected_candidates: torch.Tensor,
+        rbg_index: int,
+    ) -> torch.Tensor:
+
+        key = tuple(
+            int(value)
+            for value
+            in selected_candidates.tolist()
+        )
+
+        return torch.tensor(
+            rates[key],
+            device=device,
+        )
+
+
+    result = run_baseline_sds(
+        initial_allocation=initial,
+        num_candidates=3,
+        score_rbg=score_rbg,
+        config=BaselineSDSConfig(),
+        candidate_valid_mask=(
+            candidate_valid_mask
+        ),
+    )
+
+    assert int(
+        result
+        .allocation
+        .candidate_by_user_slot[
+            1,
+            0,
+        ].item()
+    ) == 2
+

@@ -200,6 +200,7 @@ def build_next_user_slot_action_mask(
     allocation: CellAllocation,
     num_candidates: int,
     user_slot_index: int,
+    candidate_valid_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Build valid actions for the next scheduler user slot.
@@ -238,6 +239,37 @@ def build_next_user_slot_action_mask(
             .device
         ),
     )
+
+    if candidate_valid_mask is not None:
+
+        if tuple(
+            candidate_valid_mask.shape
+        ) != (
+            num_candidates,
+        ):
+            raise ValueError(
+                "candidate_valid_mask must have "
+                "shape [candidate]."
+            )
+
+        valid_candidates = (
+            candidate_valid_mask.to(
+                device=mask.device,
+                dtype=torch.bool,
+            )
+        )
+
+        mask[
+            :,
+            :num_candidates,
+        ] = (
+            valid_candidates
+            .unsqueeze(0)
+            .expand(
+                num_rbgs,
+                -1,
+            )
+        )
 
     if user_slot_index == 0:
         return mask
@@ -284,9 +316,146 @@ def build_next_user_slot_action_mask(
         num_candidates,
     ] = True
 
+
     return mask
 
 
+def build_initial_allocation_from_fds(
+    selected_candidate_by_rbg: torch.Tensor,
+    selected_rbg_valid_mask: torch.Tensor,
+    num_user_slots: int,
+) -> CellAllocation:
+    """
+    Convert an initial SU-MIMO FDS decision into the
+    CellAllocation representation used by SDS.
+
+    Inputs:
+
+        selected_candidate_by_rbg:
+            [RBG]
+
+            Candidate index selected by FDS for each RBG.
+
+        selected_rbg_valid_mask:
+            [RBG]
+
+            True when FDS allocated that RBG.
+            False when the RBG is unallocated.
+
+        num_user_slots:
+            Maximum number of spatially co-scheduled UEs
+            allowed per RBG.
+
+    Output:
+
+        candidate_by_user_slot:
+            [user_slot, RBG]
+
+    Only user slot 0 is populated. All later slots are left
+    as NO_ALLOCATION for SDS to fill.
+
+    Important:
+        This function defines only the FDS -> SDS interface.
+        It makes no assumption about which FDS algorithm
+        produced the first-layer allocation.
+    """
+
+    if selected_candidate_by_rbg.ndim != 1:
+        raise ValueError(
+            "selected_candidate_by_rbg must have "
+            "shape [RBG]."
+        )
+
+    if selected_rbg_valid_mask.ndim != 1:
+        raise ValueError(
+            "selected_rbg_valid_mask must have "
+            "shape [RBG]."
+        )
+
+    if (
+        selected_candidate_by_rbg.shape
+        != selected_rbg_valid_mask.shape
+    ):
+        raise ValueError(
+            "FDS candidate indices and validity mask "
+            "must have identical shapes."
+        )
+
+    if (
+        selected_candidate_by_rbg.device
+        != selected_rbg_valid_mask.device
+    ):
+        raise ValueError(
+            "FDS tensors must be on the same device."
+        )
+
+    if num_user_slots <= 0:
+        raise ValueError(
+            "num_user_slots must be positive."
+        )
+    
+
+    if torch.is_floating_point(
+        selected_candidate_by_rbg
+    ):
+        raise ValueError(
+            "FDS candidate indices must use "
+            "an integer dtype."
+        )
+
+    selected_rbg_valid_mask = (
+        selected_rbg_valid_mask.to(
+            dtype=torch.bool
+        )
+    )
+
+    valid_candidate_indices = (
+        selected_candidate_by_rbg[
+            selected_rbg_valid_mask
+        ]
+    )
+
+    if torch.any(
+        valid_candidate_indices < 0
+    ):
+        raise ValueError(
+            "A valid FDS RBG cannot contain "
+            "a negative candidate index."
+        )
+
+    num_rbgs = int(
+        selected_candidate_by_rbg.numel()
+    )
+
+    actions = torch.full(
+        (
+            num_user_slots,
+            num_rbgs,
+        ),
+        fill_value=NO_ALLOCATION,
+        dtype=torch.long,
+        device=(
+            selected_candidate_by_rbg.device
+        ),
+    )
+
+
+    actions[
+        0,
+        selected_rbg_valid_mask,
+    ] = (
+        selected_candidate_by_rbg[
+            selected_rbg_valid_mask
+        ]
+        .to(
+            dtype=torch.long
+        )
+    )
+
+
+    return CellAllocation(
+        candidate_by_user_slot=actions
+    )
 
 
 
