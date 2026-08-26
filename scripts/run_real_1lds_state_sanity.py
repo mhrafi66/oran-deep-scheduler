@@ -21,8 +21,15 @@ from oran_scheduler.phy.sinr import (
 from oran_scheduler.phy.su_mimo_reports import (
     build_single_user_phy_reports,
 )
+
+from oran_scheduler.phy.schedule_evaluator import (
+    evaluate_cell_allocation,
+)
+
+
 from oran_scheduler.schedulers.allocation import (
     NO_ALLOCATION,
+    selected_candidates_for_rbg,
 )
 from oran_scheduler.schedulers.one_lds_loop import (
     run_1lds_user_slot_loop,
@@ -1389,12 +1396,502 @@ def main() -> None:
             .state
         ).all()
 
+
+    # ------------------------------------------------------------------
+    # Final 1LDS allocation -> common MU-MIMO PHY
+    # ------------------------------------------------------------------
+    #
+    # The deep scheduler has now finished all of its
+    # UE-slot allocation decisions.
+    #
+    # Only NOW do we evaluate the completed schedule
+    # through the physical MU-MIMO chain:
+    #
+    # allocation
+    #     -> rank expansion
+    #     -> RZF
+    #     -> post-RZF MRC
+    #     -> SINR
+    #     -> MCS / TBLER
+    #     -> rate
+
+    allocation_evaluation = evaluate_cell_allocation(
+        allocation=final_allocation,
+        candidate_global_ue_indices=(
+            candidate_global_ue_indices
+        ),
+        h_freq=channel.h_freq,
+        serving_cell_index=cell_index,
+        recommended_rank=(
+            csi_data.recommended_rank
+        ),
+        rx_combiners=(
+            csi_data.rx_combiners
+        ),
+        csi_subcarrier_index=(
+            csi_data.csi_subcarrier_index
+        ),
+        subcarriers_per_rbg=(
+            rbg_config.subcarriers_per_rbg
+        ),
+        tx_power_per_subcarrier_w=(
+            tx_power_per_subcarrier_w
+        ),
+        noise_power_per_subcarrier_w=(
+            noise_power_per_subcarrier_w
+        ),
+        link_adaptation_config=(
+            link_adaptation_config
+        ),
+        rate_config=rate_config,
+        batch_index=0,
+    )
+
+    assert tuple(
+        allocation_evaluation
+        .candidate_target_compliant_rate_bps
+        .shape
+    ) == (
+        num_candidates,
+        num_rbgs,
+    )
+
+    assert tuple(
+        allocation_evaluation
+        .total_rbg_target_compliant_rate_bps
+        .shape
+    ) == (
+        num_rbgs,
+    )
+
+    assert tuple(
+        allocation_evaluation
+        .num_scheduled_ues_per_rbg
+        .shape
+    ) == (
+        num_rbgs,
+    )
+
+    assert tuple(
+        allocation_evaluation
+        .num_physical_layers_per_rbg
+        .shape
+    ) == (
+        num_rbgs,
+    )
+
+    assert tuple(
+        allocation_evaluation
+        .rzf_alpha_by_rbg
+        .shape
+    ) == (
+        num_rbgs,
+    )
+
+    assert torch.isfinite(
+        allocation_evaluation
+        .candidate_target_compliant_rate_bps
+    ).all()
+
+    assert torch.isfinite(
+        allocation_evaluation
+        .total_rbg_target_compliant_rate_bps
+    ).all()
+
+    assert torch.isfinite(
+        allocation_evaluation
+        .rzf_alpha_by_rbg
+    ).all()
+
+    assert torch.all(
+        allocation_evaluation
+        .candidate_target_compliant_rate_bps
+        >= 0.0
+    )
+
+    # ------------------------------------------------------------------
+    # Cross-check:
+    #
+    # scheduler UE slots
+    #     versus
+    # physical MIMO streams
+    # ------------------------------------------------------------------
+
+    for rbg_index in range(
+        num_rbgs
+    ):
+        selected_candidates = (
+            selected_candidates_for_rbg(
+                allocation=final_allocation,
+                rbg_index=rbg_index,
+            )
+        )
+
+        expected_num_ues = int(
+            selected_candidates.numel()
+        )
+
+        if expected_num_ues == 0:
+            expected_num_layers = 0
+
+        else:
+            expected_num_layers = int(
+                candidate_rank[
+                    selected_candidates
+                ]
+                .sum()
+                .item()
+            )
+
+        actual_num_ues = int(
+            allocation_evaluation
+            .num_scheduled_ues_per_rbg[
+                rbg_index
+            ]
+            .item()
+        )
+
+        actual_num_layers = int(
+            allocation_evaluation
+            .num_physical_layers_per_rbg[
+                rbg_index
+            ]
+            .item()
+        )
+
+        assert actual_num_ues == (
+            expected_num_ues
+        )
+
+        assert actual_num_layers == (
+            expected_num_layers
+        )
+
+    expected_rbg_total_rate = (
+        allocation_evaluation
+        .candidate_target_compliant_rate_bps
+        .sum(
+            dim=0
+        )
+    )
+
+    torch.testing.assert_close(
+        allocation_evaluation
+        .total_rbg_target_compliant_rate_bps,
+        expected_rbg_total_rate,
+    )
+
+    expected_cell_total_rate = (
+        allocation_evaluation
+        .total_rbg_target_compliant_rate_bps
+        .sum()
+    )
+
+    torch.testing.assert_close(
+        allocation_evaluation
+        .total_cell_target_compliant_rate_bps,
+        expected_cell_total_rate,
+    )
+
     print()
     print("=" * 72)
     print(
-        "REAL COMPLETE 4-SLOT 1LDS "
-        "LOOP SANITY PASSED"
+        "Final 1LDS Allocation -> "
+        "Real MU-MIMO PHY"
     )
+    print("=" * 72)
+
+    for rbg_index in range(
+        num_rbgs
+    ):
+        selected_candidates = (
+            selected_candidates_for_rbg(
+                allocation=final_allocation,
+                rbg_index=rbg_index,
+            )
+        )
+
+        selected_candidate_list = (
+            selected_candidates
+            .detach()
+            .cpu()
+            .tolist()
+        )
+
+        selected_global_ues = (
+            candidate_global_ue_indices[
+                selected_candidates
+            ]
+        )
+
+        selected_global_ue_list = (
+            selected_global_ues
+            .detach()
+            .cpu()
+            .tolist()
+        )
+
+        selected_ranks = (
+            candidate_rank[
+                selected_candidates
+            ]
+        )
+
+        selected_rank_list = (
+            selected_ranks
+            .detach()
+            .cpu()
+            .tolist()
+        )
+
+        num_scheduled_ues = int(
+            allocation_evaluation
+            .num_scheduled_ues_per_rbg[
+                rbg_index
+            ]
+            .item()
+        )
+
+        num_physical_layers = int(
+            allocation_evaluation
+            .num_physical_layers_per_rbg[
+                rbg_index
+            ]
+            .item()
+        )
+
+        rzf_alpha = float(
+            allocation_evaluation
+            .rzf_alpha_by_rbg[
+                rbg_index
+            ]
+            .item()
+        )
+
+        rbg_total_rate_mbps = float(
+            allocation_evaluation
+            .total_rbg_target_compliant_rate_bps[
+                rbg_index
+            ]
+            .item()
+            / 1.0e6
+        )
+
+        print()
+        print(
+            f"RBG {rbg_index:2d}"
+        )
+
+        print(
+            "  candidate slots:       "
+            f"{selected_candidate_list}"
+        )
+
+        print(
+            "  global UE IDs:         "
+            f"{selected_global_ue_list}"
+        )
+
+        print(
+            "  UE ranks:              "
+            f"{selected_rank_list}"
+        )
+
+        print(
+            "  scheduled UEs:         "
+            f"{num_scheduled_ues}"
+        )
+
+        print(
+            "  physical streams:      "
+            f"{num_physical_layers}"
+        )
+
+        print(
+            "  RZF alpha:             "
+            f"{rzf_alpha:.6e}"
+        )
+
+        print(
+            "  total PHY rate:        "
+            f"{rbg_total_rate_mbps:.6f} Mbps"
+        )
+
+        print(
+            "  per-UE target-compliant rates:"
+        )
+
+        for candidate_index_tensor in (
+            selected_candidates
+        ):
+            candidate_index = int(
+                candidate_index_tensor.item()
+            )
+
+            global_ue_index = int(
+                candidate_global_ue_indices[
+                    candidate_index
+                ]
+                .item()
+            )
+
+            ue_rate_mbps = float(
+                allocation_evaluation
+                .candidate_target_compliant_rate_bps[
+                    candidate_index,
+                    rbg_index,
+                ]
+                .item()
+                / 1.0e6
+            )
+
+            print(
+                "    "
+                f"candidate {candidate_index}, "
+                f"global UE {global_ue_index}: "
+                f"{ue_rate_mbps:.6f} Mbps"
+            )
+    candidate_total_rate_bps = (
+        allocation_evaluation
+        .candidate_target_compliant_rate_bps
+        .sum(
+            dim=1
+        )
+    )
+
+    print()
+    print("=" * 72)
+    print("Candidate Throughput Across All RBGs")
+    print("=" * 72)
+
+    for candidate_index in range(
+        num_candidates
+    ):
+        if not bool(
+            candidate_valid_mask[
+                candidate_index
+            ]
+            .item()
+        ):
+            continue
+
+        global_ue_index = int(
+            candidate_global_ue_indices[
+                candidate_index
+            ]
+            .item()
+        )
+
+        rank_value = int(
+            candidate_rank[
+                candidate_index
+            ]
+            .item()
+        )
+
+        candidate_rate_mbps = float(
+            candidate_total_rate_bps[
+                candidate_index
+            ]
+            .item()
+            / 1.0e6
+        )
+
+        print(
+            f"Candidate {candidate_index}: "
+            f"global UE {global_ue_index}, "
+            f"rank {rank_value}, "
+            f"{candidate_rate_mbps:.6f} Mbps"
+        )
+
+    total_cell_rate_mbps = float(
+        allocation_evaluation
+        .total_cell_target_compliant_rate_bps
+        .item()
+        / 1.0e6
+    )
+
+    print()
+    print(
+        "Total chosen-cell target-compliant "
+        "PHY rate:"
+    )
+
+    print(
+        f"{total_cell_rate_mbps:.6f} Mbps"
+    )
+
+
+    print()
+    print("=" * 72)
+    print(
+        "REAL 1LDS -> FINAL ALLOCATION -> "
+        "MU-MIMO PHY SANITY PASSED"
+    )
+    print("=" * 72)
+
+    print()
+    print("End-to-end path validated:")
+
+    print(
+        "PF TDS"
+    )
+
+    print(
+        "  -> candidate UE set"
+    )
+
+    print(
+        "  -> 410-dimensional 1LDS states"
+    )
+
+    print(
+        "  -> four UE-slot decisions"
+    )
+
+    print(
+        "  -> final CellAllocation"
+    )
+
+    print(
+        "  -> rank expansion to physical streams"
+    )
+
+    print(
+        "  -> joint RZF precoding"
+    )
+
+    print(
+        "  -> physical post-RZF MRC"
+    )
+
+    print(
+        "  -> SINR / MCS / TBLER"
+    )
+
+    print(
+        "  -> per-UE and cell throughput"
+    )
+
+    print()
+    print("IMPORTANT:")
+
+    print(
+        "- The controlled action callback is "
+        "still NOT an RL policy."
+    )
+
+    print(
+        "- SVD directions remain CSI/PMI-direction "
+        "surrogates."
+    )
+
+    print(
+        "- Current throughput history and buffer "
+        "values remain temporary placeholders."
+    )
+
+
     print("=" * 72)
 
     print()
