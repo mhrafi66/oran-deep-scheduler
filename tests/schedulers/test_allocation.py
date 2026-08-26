@@ -4,13 +4,14 @@ import torch
 from oran_scheduler.schedulers.allocation import (
     NO_ALLOCATION,
     CellAllocation,
+    apply_user_slot_actions,
+    build_empty_cell_allocation,
     build_initial_allocation_from_fds,
     build_next_user_slot_action_mask,
     selected_candidates_for_rbg,
     selected_global_ues_for_rbg,
     validate_cell_allocation,
 )
-
 
 def test_selected_candidates_and_global_ues():
     device = "cuda:0"
@@ -313,5 +314,175 @@ def test_action_mask_excludes_invalid_candidates():
         ].item()
     )
 
+
+def test_build_empty_cell_allocation():
+    device = "cuda:0"
+
+    allocation = build_empty_cell_allocation(
+        num_user_slots=4,
+        num_rbgs=3,
+        device=device,
+    )
+
+    expected = torch.full(
+        (
+            4,
+            3,
+        ),
+        fill_value=NO_ALLOCATION,
+        dtype=torch.long,
+        device=device,
+    )
+
+    torch.testing.assert_close(
+        allocation.candidate_by_user_slot,
+        expected,
+    )
+
+    assert allocation.num_user_slots == 4
+    assert allocation.num_rbgs == 3
+
+
+def test_apply_first_user_slot_actions():
+    device = "cuda:0"
+
+    allocation = build_empty_cell_allocation(
+        num_user_slots=3,
+        num_rbgs=4,
+        device=device,
+    )
+
+    # num_candidates = 3
+    #
+    # Candidate actions:
+    #   0, 1, 2
+    #
+    # No-allocation action:
+    #   3
+    actions = torch.tensor(
+        [
+            0,
+            2,
+            3,
+            1,
+        ],
+        dtype=torch.long,
+        device=device,
+    )
+
+    updated = apply_user_slot_actions(
+        allocation=allocation,
+        user_slot_index=0,
+        actions=actions,
+        num_candidates=3,
+    )
+
+    expected = torch.tensor(
+        [
+            [0, 2, -1, 1],
+            [-1, -1, -1, -1],
+            [-1, -1, -1, -1],
+        ],
+        dtype=torch.long,
+        device=device,
+    )
+
+    torch.testing.assert_close(
+        updated.candidate_by_user_slot,
+        expected,
+    )
+
+    # Original object must remain unchanged.
+    assert torch.all(
+        allocation.candidate_by_user_slot
+        == NO_ALLOCATION
+    )
+
+def test_apply_next_user_slot_rejects_duplicate_candidate():
+    device = "cuda:0"
+
+    allocation = build_empty_cell_allocation(
+        num_user_slots=2,
+        num_rbgs=2,
+        device=device,
+    )
+
+    first_actions = torch.tensor(
+        [
+            0,
+            1,
+        ],
+        dtype=torch.long,
+        device=device,
+    )
+
+    allocation = apply_user_slot_actions(
+        allocation=allocation,
+        user_slot_index=0,
+        actions=first_actions,
+        num_candidates=3,
+    )
+
+    duplicate_actions = torch.tensor(
+        [
+            0,
+            2,
+        ],
+        dtype=torch.long,
+        device=device,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="masked or invalid",
+    ):
+        apply_user_slot_actions(
+            allocation=allocation,
+            user_slot_index=1,
+            actions=duplicate_actions,
+            num_candidates=3,
+        )
+
+def test_apply_user_slot_actions_rejects_padded_candidate():
+    device = "cuda:0"
+
+    allocation = build_empty_cell_allocation(
+        num_user_slots=2,
+        num_rbgs=2,
+        device=device,
+    )
+
+    candidate_valid_mask = torch.tensor(
+        [
+            True,
+            True,
+            False,
+        ],
+        dtype=torch.bool,
+        device=device,
+    )
+
+    actions = torch.tensor(
+        [
+            2,
+            1,
+        ],
+        dtype=torch.long,
+        device=device,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="masked or invalid",
+    ):
+        apply_user_slot_actions(
+            allocation=allocation,
+            user_slot_index=0,
+            actions=actions,
+            num_candidates=3,
+            candidate_valid_mask=(
+                candidate_valid_mask
+            ),
+        )
 
 
