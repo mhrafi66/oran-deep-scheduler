@@ -320,6 +320,212 @@ def build_next_user_slot_action_mask(
     return mask
 
 
+def build_empty_cell_allocation(
+    num_user_slots: int,
+    num_rbgs: int,
+    device: str | torch.device,
+) -> CellAllocation:
+    """
+    Create an empty candidate allocation for one cell.
+
+    This is the natural starting allocation for the
+    deep scheduler before user-slot 0 is decided.
+
+    Shape:
+        [user_slot, RBG]
+
+    Every entry initially contains NO_ALLOCATION.
+    """
+
+    if num_user_slots <= 0:
+        raise ValueError(
+            "num_user_slots must be positive."
+        )
+
+    if num_rbgs <= 0:
+        raise ValueError(
+            "num_rbgs must be positive."
+        )
+
+    actions = torch.full(
+        (
+            num_user_slots,
+            num_rbgs,
+        ),
+        fill_value=NO_ALLOCATION,
+        dtype=torch.long,
+        device=device,
+    )
+
+    return CellAllocation(
+        candidate_by_user_slot=actions
+    )
+
+
+def apply_user_slot_actions(
+    allocation: CellAllocation,
+    user_slot_index: int,
+    actions: torch.Tensor,
+    num_candidates: int,
+    candidate_valid_mask: torch.Tensor | None = None,
+) -> CellAllocation:
+    """
+    Apply one complete 1LDS user-slot action vector.
+
+    actions:
+        [RBG]
+
+    Actor action convention:
+
+        0 ... num_candidates - 1
+            select that candidate UE
+
+        num_candidates
+            no-allocation action
+
+    CellAllocation convention:
+
+        0 ... num_candidates - 1
+            selected candidate
+
+        NO_ALLOCATION (-1)
+            no allocation
+
+    The returned allocation is a new CellAllocation;
+    the input allocation is not modified in place.
+    """
+
+    if not (
+        0
+        <= user_slot_index
+        < allocation.num_user_slots
+    ):
+        raise ValueError(
+            "user_slot_index is invalid."
+        )
+
+    if tuple(
+        actions.shape
+    ) != (
+        allocation.num_rbgs,
+    ):
+        raise ValueError(
+            "actions must have shape [RBG]."
+        )
+
+    if torch.is_floating_point(
+        actions
+    ):
+        raise ValueError(
+            "Actions must use an integer dtype."
+        )
+
+    if actions.device != (
+        allocation
+        .candidate_by_user_slot
+        .device
+    ):
+        raise ValueError(
+            "Actions and allocation must be "
+            "on the same device."
+        )
+
+    if torch.any(
+        actions < 0
+    ):
+        raise ValueError(
+            "Actor actions cannot be negative."
+        )
+
+    if torch.any(
+        actions > num_candidates
+    ):
+        raise ValueError(
+            "Actor action exceeds the "
+            "no-allocation action index."
+        )
+    current_slot = (
+        allocation
+        .candidate_by_user_slot[
+            user_slot_index,
+            :,
+        ]
+    )
+
+    if torch.any(
+        current_slot != NO_ALLOCATION
+    ):
+        raise ValueError(
+            "The target user slot has already "
+            "been populated."
+        )
+
+    action_mask = (
+        build_next_user_slot_action_mask(
+            allocation=allocation,
+            num_candidates=num_candidates,
+            user_slot_index=user_slot_index,
+            candidate_valid_mask=(
+                candidate_valid_mask
+            ),
+        )
+    )
+
+    rbg_indices = torch.arange(
+        allocation.num_rbgs,
+        device=actions.device,
+    )
+
+    chosen_actions_are_valid = (
+        action_mask[
+            rbg_indices,
+            actions,
+        ]
+    )
+
+    if not bool(
+        chosen_actions_are_valid
+        .all()
+        .item()
+    ):
+        raise ValueError(
+            "Action vector contains at least one "
+            "masked or invalid action."
+        )
+
+    updated_actions = (
+        allocation
+        .candidate_by_user_slot
+        .clone()
+    )
+
+    allocation_values = torch.where(
+        actions == num_candidates,
+        torch.full_like(
+            actions,
+            fill_value=NO_ALLOCATION,
+        ),
+        actions,
+    )
+
+    updated_actions[
+        user_slot_index,
+        :,
+    ] = allocation_values
+
+    updated_allocation = CellAllocation(
+        candidate_by_user_slot=(
+            updated_actions
+        )
+    )
+
+    validate_cell_allocation(
+        allocation=updated_allocation,
+        num_candidates=num_candidates,
+    )
+
+    return updated_allocation
+
 def build_initial_allocation_from_fds(
     selected_candidate_by_rbg: torch.Tensor,
     selected_rbg_valid_mask: torch.Tensor,

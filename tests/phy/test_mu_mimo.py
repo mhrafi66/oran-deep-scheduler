@@ -11,6 +11,10 @@ from oran_scheduler.phy.mu_mimo import (
 )
 
 from oran_scheduler.phy.mu_mimo import (
+    evaluate_mu_mimo_layer_sinr_with_post_precoder_mrc,
+)
+
+from oran_scheduler.phy.mu_mimo import (
     evaluate_mu_mimo_layer_sinr_with_precoder,
 )
 
@@ -536,4 +540,172 @@ def test_fixed_precoder_over_multiple_subcarriers():
         atol=1.0e-6,
         rtol=1.0e-6,
     )
+
+def test_post_precoder_mrc_tracks_physical_channel():
+    device = "cuda:0"
+
+    # Shape:
+    #
+    # [symbol, subcarrier, layer, RX, TX]
+    #
+    h = torch.zeros(
+        (
+            1,
+            2,
+            2,
+            2,
+            2,
+        ),
+        dtype=torch.complex64,
+        device=device,
+    )
+
+    channel_sc0 = torch.tensor(
+        [
+            [1.0, 0.0],
+            [2.0, 1.0],
+        ],
+        dtype=torch.complex64,
+        device=device,
+    )
+
+    channel_sc1 = torch.tensor(
+        [
+            [2.0, 0.0],
+            [0.0, 1.0],
+        ],
+        dtype=torch.complex64,
+        device=device,
+    )
+
+    # Both physical layers belong to the same rank-2 UE,
+    # so they share the same physical MIMO channel.
+    h[
+        0,
+        0,
+        0,
+        :,
+        :,
+    ] = channel_sc0
+
+    h[
+        0,
+        0,
+        1,
+        :,
+        :,
+    ] = channel_sc0
+
+    h[
+        0,
+        1,
+        0,
+        :,
+        :,
+    ] = channel_sc1
+
+    h[
+        0,
+        1,
+        1,
+        :,
+        :,
+    ] = channel_sc1
+
+    precoder = torch.eye(
+        2,
+        dtype=torch.complex64,
+        device=device,
+    )
+
+    result = (
+        evaluate_mu_mimo_layer_sinr_with_post_precoder_mrc(
+            layer_physical_channel=h,
+            precoding_matrix=precoder,
+            total_tx_power_w=2.0,
+            noise_power_w=1.0,
+        )
+    )
+
+    assert result.mrc_combiner is not None
+
+    assert tuple(
+        result.mrc_combiner.shape
+    ) == (
+        1,
+        2,
+        2,
+        2,
+    )
+
+    sqrt_five = torch.sqrt(
+        torch.tensor(
+            5.0,
+            device=device,
+        )
+    )
+
+    expected_sc0_layer0 = (
+        torch.tensor(
+            [
+                1.0,
+                2.0,
+            ],
+            dtype=torch.complex64,
+            device=device,
+        )
+        / sqrt_five
+    )
+
+    torch.testing.assert_close(
+        result.mrc_combiner[
+            0,
+            0,
+            0,
+            :,
+        ],
+        expected_sc0_layer0,
+        atol=1.0e-6,
+        rtol=1.0e-6,
+    )
+
+    expected_sc1_layer0 = torch.tensor(
+        [
+            1.0,
+            0.0,
+        ],
+        dtype=torch.complex64,
+        device=device,
+    )
+
+    torch.testing.assert_close(
+        result.mrc_combiner[
+            0,
+            1,
+            0,
+            :,
+        ],
+        expected_sc1_layer0,
+        atol=1.0e-6,
+        rtol=1.0e-6,
+    )
+
+    assert not torch.allclose(
+        result.mrc_combiner[
+            0,
+            0,
+            0,
+            :,
+        ],
+        result.mrc_combiner[
+            0,
+            1,
+            0,
+            :,
+        ],
+    )
+
+    assert torch.isfinite(
+        result.sinr_linear
+    ).all()
 
