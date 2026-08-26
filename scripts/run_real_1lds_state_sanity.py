@@ -23,18 +23,25 @@ from oran_scheduler.phy.su_mimo_reports import (
 )
 from oran_scheduler.schedulers.allocation import (
     NO_ALLOCATION,
-    build_next_user_slot_action_mask,
 )
-from oran_scheduler.schedulers.classical_frontend import (
-    build_classical_initial_cell_allocation,
-    run_classical_frontend,
+from oran_scheduler.schedulers.one_lds_loop import (
+    run_1lds_user_slot_loop,
 )
+# from oran_scheduler.schedulers.classical_frontend import (
+#     build_classical_initial_cell_allocation,
+#     run_classical_frontend,
+# )
+# from oran_scheduler.schedulers.pf_tds import (
+#     PFTimeDomainConfig,
+# )
+# from oran_scheduler.schedulers.su_mimo_fds import (
+#     SUMIMOFDSConfig,
+# )
 from oran_scheduler.schedulers.pf_tds import (
     PFTimeDomainConfig,
+    run_pf_tds,
 )
-from oran_scheduler.schedulers.su_mimo_fds import (
-    SUMIMOFDSConfig,
-)
+
 from oran_scheduler.simulator.cell_association import (
     build_cell_association,
 )
@@ -48,7 +55,9 @@ from oran_scheduler.simulator.rbg import (
 )
 from oran_scheduler.simulator.serving_layout import (
     build_serving_cell_data,
+    gather_candidate_global_ue_indices,
     gather_candidate_rbg_values,
+    gather_candidate_ue_values,
     gather_serving_ue_rbg_values,
 )
 from oran_scheduler.simulator.topology import (
@@ -59,15 +68,21 @@ from oran_scheduler.state.cqi_features import (
     CQISurrogateConfig,
     build_cqi_surrogate,
 )
+# from oran_scheduler.state.one_lds import (
+#     OneLDSRawFeatures,
+#     OneLDSStateConfig,
+#     build_1lds_state,
+# )
+# from oran_scheduler.state.spatial_features import (
+#     build_spatial_allocation_features,
+# )
 from oran_scheduler.state.one_lds import (
-    OneLDSRawFeatures,
     OneLDSStateConfig,
-    build_1lds_state,
 )
-from oran_scheduler.state.spatial_features import (
-    build_spatial_allocation_features,
+from oran_scheduler.state.one_lds_decision import (
+    OneLDSDecisionInputs,
+    build_1lds_decision_data,
 )
-
 
 def print_first_candidate_features(
     feature_segment: torch.Tensor,
@@ -167,8 +182,15 @@ def main() -> None:
     num_candidates = 10
     num_rbgs = 18
 
-    # Paper training configuration uses four scheduler
-    # MU-MIMO user slots.
+    # PAPER-SPECIFIED training configuration:
+    #
+    # Maximum MU-MIMO UE layers |L| = 4.
+    #
+    # Here one "user slot" means one co-scheduled UE
+    # position on an RBG, NOT one physical MIMO stream.
+    #
+    # A rank-2 UE selected in one user slot later
+    # expands into two physical MIMO streams.
     num_user_slots = 4
 
     # TEMPORARY one-shot scheduler-history initialization.
@@ -493,28 +515,110 @@ def main() -> None:
         * initial_history_bps
     )
 
-    frontend = run_classical_frontend(
-        ue_rbg_rate=serving_rbg_rate,
-        global_ue_indices=(
-            serving_data
-            .global_ue_indices
+    # frontend = run_classical_frontend(
+    #     ue_rbg_rate=serving_rbg_rate,
+    #     global_ue_indices=(
+    #         serving_data
+    #         .global_ue_indices
+    #     ),
+    #     valid_ue_mask=(
+    #         serving_data
+    #         .valid_ue_mask
+    #     ),
+    #     past_average_throughput=(
+    #         past_average_throughput
+    #     ),
+    #     tds_config=PFTimeDomainConfig(
+    #         num_candidates=num_candidates,
+    #     ),
+    #     fds_config=SUMIMOFDSConfig(),
+    # )
+
+    # candidate_shape = tuple(
+    #     frontend
+    #     .tds_result
+    #     .candidate_indices
+    #     .shape
+    # )
+
+    # print(
+    #     "PF candidate shape:        "
+    #     f"{candidate_shape}"
+    # )
+
+    # assert candidate_shape == (
+    #     1,
+    #     topology_config.num_cells,
+    #     num_candidates,
+    # )
+
+
+    # ------------------------------------------------------------------
+    # PF time-domain candidate selection
+    # ------------------------------------------------------------------
+    #
+    # PAPER-SPECIFIED:
+    #     PF TDS supplies at most 10 candidate UEs.
+    #
+    # IMPORTANT:
+    #     We deliberately do NOT run the open PF-based FDS
+    #     surrogate here. The deep scheduler begins from the
+    #     TDS candidate set and an empty allocation.
+
+    td_instantaneous_rate = (
+        serving_rbg_rate.sum(
+            dim=-1
+        )
+    )
+
+    tds_result = run_pf_tds(
+        instantaneous_rate=(
+            td_instantaneous_rate
+        ),
+        past_average_throughput=(
+            past_average_throughput
+        ),
+        config=PFTimeDomainConfig(
+            num_candidates=num_candidates,
         ),
         valid_ue_mask=(
             serving_data
             .valid_ue_mask
         ),
-        past_average_throughput=(
-            past_average_throughput
-        ),
-        tds_config=PFTimeDomainConfig(
-            num_candidates=num_candidates,
-        ),
-        fds_config=SUMIMOFDSConfig(),
+    )
+
+    candidate_global_ue_indices_all = (
+        gather_candidate_global_ue_indices(
+            serving_data=serving_data,
+            candidate_indices=(
+                tds_result
+                .candidate_indices
+            ),
+            candidate_valid_mask=(
+                tds_result
+                .candidate_valid_mask
+            ),
+        )
+    )
+
+    candidate_history_all = (
+        gather_candidate_ue_values(
+            ue_values=(
+                past_average_throughput
+            ),
+            candidate_indices=(
+                tds_result
+                .candidate_indices
+            ),
+            candidate_valid_mask=(
+                tds_result
+                .candidate_valid_mask
+            ),
+        )
     )
 
     candidate_shape = tuple(
-        frontend
-        .tds_result
+        tds_result
         .candidate_indices
         .shape
     )
@@ -553,9 +657,46 @@ def main() -> None:
         .item()
     )
 
+    # candidate_valid_mask = (
+    #     frontend
+    #     .tds_result
+    #     .candidate_valid_mask[
+    #         0,
+    #         cell_index,
+    #         :,
+    #     ]
+    # )
+
+    # candidate_global_ue_indices = (
+    #     frontend
+    #     .candidate_global_ue_indices[
+    #         0,
+    #         cell_index,
+    #         :,
+    #     ]
+    # )
+
+    # candidate_pf_metric = (
+    #     frontend
+    #     .tds_result
+    #     .candidate_metrics[
+    #         0,
+    #         cell_index,
+    #         :,
+    #     ]
+    # )
+
+    # candidate_history = (
+    #     frontend
+    #     .candidate_past_average_throughput[
+    #         0,
+    #         cell_index,
+    #         :,
+    #     ]
+    # )
+
     candidate_valid_mask = (
-        frontend
-        .tds_result
+        tds_result
         .candidate_valid_mask[
             0,
             cell_index,
@@ -564,8 +705,7 @@ def main() -> None:
     )
 
     candidate_global_ue_indices = (
-        frontend
-        .candidate_global_ue_indices[
+        candidate_global_ue_indices_all[
             0,
             cell_index,
             :,
@@ -573,8 +713,7 @@ def main() -> None:
     )
 
     candidate_pf_metric = (
-        frontend
-        .tds_result
+        tds_result
         .candidate_metrics[
             0,
             cell_index,
@@ -583,13 +722,15 @@ def main() -> None:
     )
 
     candidate_history = (
-        frontend
-        .candidate_past_average_throughput[
+        candidate_history_all[
             0,
             cell_index,
             :,
         ]
     )
+
+
+
 
     num_valid_candidates = int(
         candidate_valid_mask
@@ -751,13 +892,11 @@ def main() -> None:
                 serving_mcs_index
             ),
             candidate_indices=(
-                frontend
-                .tds_result
+                tds_result
                 .candidate_indices
             ),
             candidate_valid_mask=(
-                frontend
-                .tds_result
+                tds_result
                 .candidate_valid_mask
             ),
         )[
@@ -774,13 +913,11 @@ def main() -> None:
                 serving_meets_target
             ),
             candidate_indices=(
-                frontend
-                .tds_result
+                tds_result
                 .candidate_indices
             ),
             candidate_valid_mask=(
-                frontend
-                .tds_result
+                tds_result
                 .candidate_valid_mask
             ),
         )[
@@ -816,67 +953,67 @@ def main() -> None:
     # Temporary initial FDS allocation
     # ------------------------------------------------------------------
 
-    allocation = (
-        build_classical_initial_cell_allocation(
-            frontend_data=frontend,
-            batch_index=0,
-            cell_index=cell_index,
-            num_user_slots=num_user_slots,
-        )
-    )
+    # allocation = (
+    #     build_classical_initial_cell_allocation(
+    #         frontend_data=frontend,
+    #         batch_index=0,
+    #         cell_index=cell_index,
+    #         num_user_slots=num_user_slots,
+    #     )
+    # )
 
-    print(
-        "Allocation shape:          "
-        f"{tuple(allocation.candidate_by_user_slot.shape)}"
-    )
+    # print(
+    #     "Allocation shape:          "
+    #     f"{tuple(allocation.candidate_by_user_slot.shape)}"
+    # )
 
-    slot_zero = (
-        allocation
-        .candidate_by_user_slot[
-            0,
-            :,
-        ]
-    )
+    # slot_zero = (
+    #     allocation
+    #     .candidate_by_user_slot[
+    #         0,
+    #         :,
+    #     ]
+    # )
 
-    slot_zero_list = (
-        slot_zero
-        .detach()
-        .cpu()
-        .tolist()
-    )
+    # slot_zero_list = (
+    #     slot_zero
+    #     .detach()
+    #     .cpu()
+    #     .tolist()
+    # )
 
-    print()
-    print(
-        "Initial FDS candidate slot "
-        "per RBG:"
-    )
+    # print()
+    # print(
+    #     "Initial FDS candidate slot "
+    #     "per RBG:"
+    # )
 
-    print(slot_zero_list)
+    # print(slot_zero_list)
 
-    spatial_features = (
-        build_spatial_allocation_features(
-            allocation=allocation,
-            candidate_rank=candidate_rank,
-            candidate_precoder_directions=(
-                candidate_precoder_directions
-            ),
-            candidate_valid_mask=(
-                candidate_valid_mask
-            ),
-        )
-    )
+    # spatial_features = (
+    #     build_spatial_allocation_features(
+    #         allocation=allocation,
+    #         candidate_rank=candidate_rank,
+    #         candidate_precoder_directions=(
+    #             candidate_precoder_directions
+    #         ),
+    #         candidate_valid_mask=(
+    #             candidate_valid_mask
+    #         ),
+    #     )
+    # )
 
-    allocated_count_list = (
-        spatial_features
-        .allocated_rbg_count
-        .detach()
-        .cpu()
-        .tolist()
-    )
+    # allocated_count_list = (
+    #     spatial_features
+    #     .allocated_rbg_count
+    #     .detach()
+    #     .cpu()
+    #     .tolist()
+    # )
 
-    print()
-    print("Allocated RBG count by candidate:")
-    print(allocated_count_list)
+    # print()
+    # print("Allocated RBG count by candidate:")
+    # print(allocated_count_list)
 
     # ------------------------------------------------------------------
     # TEMPORARY buffer state
@@ -930,15 +1067,12 @@ def main() -> None:
         wideband_cqi_max=15.0,
     )
 
-    raw_features = OneLDSRawFeatures(
+
+    decision_inputs = OneLDSDecisionInputs(
         past_average_throughput=(
             candidate_history
         ),
         rank=candidate_rank,
-        allocated_rbg_count=(
-            spatial_features
-            .allocated_rbg_count
-        ),
         dl_buffer=dl_buffer,
         wideband_cqi=(
             cqi_features
@@ -948,379 +1082,1158 @@ def main() -> None:
             cqi_features
             .subband_cqi
         ),
-        max_precoder_cross_correlation=(
-            spatial_features
-            .max_precoder_cross_correlation
+        candidate_precoder_directions=(
+            candidate_precoder_directions
         ),
         candidate_valid_mask=(
             candidate_valid_mask
         ),
     )
 
-    state_data = build_1lds_state(
-        features=raw_features,
-        config=state_config,
-    )
+    def controlled_policy(
+        user_slot_index: int,
+        decision,
+    ) -> torch.Tensor:
+        """
+        Deterministic integration-test policy.
 
-    # ------------------------------------------------------------------
-    # State validation
-    # ------------------------------------------------------------------
+        This is NOT an RL policy.
 
-    expected_segment_shape = (
-        num_candidates,
-        41,
-    )
+        For every RBG:
 
-    expected_state_shape = (
-        410,
-    )
+            1. Try candidate UEs in a rotating order.
+            2. Choose the first candidate allowed by
+               the current action mask.
+            3. If no real candidate is available,
+               choose NO ALLOCATION.
 
-    assert tuple(
-        state_data
-        .ue_feature_segments
-        .shape
-    ) == expected_segment_shape
+        This intentionally exercises state evolution
+        and action masking across all UE slots.
+        """
 
-    assert tuple(
-        state_data
-        .state
-        .shape
-    ) == expected_state_shape
+        action_mask = decision.action_mask
 
-    assert state_config.ue_feature_size == 41
-    assert state_config.state_size == 410
-    assert state_config.actor_output_size == 198
-
-    assert torch.isfinite(
-        state_data.state
-    ).all()
-
-    invalid_candidate_mask = (
-        ~candidate_valid_mask
-    )
-
-    if bool(
-        invalid_candidate_mask.any().item()
-    ):
-        invalid_segments = (
-            state_data
-            .ue_feature_segments[
-                invalid_candidate_mask
-            ]
-        )
-
-        assert torch.all(
-            invalid_segments == 0.0
-        )
-
-    # ------------------------------------------------------------------
-    # Existing allocation -> next 1LDS user-slot action mask
-    # ------------------------------------------------------------------
-
-    next_action_mask = (
-        build_next_user_slot_action_mask(
-            allocation=allocation,
-            num_candidates=num_candidates,
-            user_slot_index=1,
-            candidate_valid_mask=(
-                candidate_valid_mask
+        actions = torch.full(
+            (
+                num_rbgs,
             ),
+            fill_value=num_candidates,
+            dtype=torch.long,
+            device=device,
         )
+
+        for rbg_index in range(
+            num_rbgs
+        ):
+            for offset in range(
+                num_candidates
+            ):
+                candidate_index = (
+                    rbg_index
+                    + user_slot_index
+                    + offset
+                ) % num_candidates
+
+                candidate_is_valid = bool(
+                    action_mask[
+                        rbg_index,
+                        candidate_index,
+                    ]
+                    .item()
+                )
+
+                if candidate_is_valid:
+                    actions[
+                        rbg_index
+                    ] = candidate_index
+
+                    break
+
+        return actions
+
+    schedule_result = run_1lds_user_slot_loop(
+        num_user_slots=num_user_slots,
+        inputs=decision_inputs,
+        state_config=state_config,
+        action_policy=controlled_policy,
+        device=device,
+    )
+
+
+    assert len(
+        schedule_result.decisions
+    ) == num_user_slots
+
+    assert tuple(
+        schedule_result.actions.shape
+    ) == (
+        num_user_slots,
+        num_rbgs,
     )
 
     assert tuple(
-        next_action_mask.shape
+        schedule_result
+        .allocation
+        .candidate_by_user_slot
+        .shape
     ) == (
+        num_user_slots,
         num_rbgs,
-        num_candidates + 1,
-    )
-
-    for rbg_index in range(
-        num_rbgs
-    ):
-        selected_candidate = int(
-            slot_zero[
-                rbg_index
-            ]
-            .item()
-        )
-
-        if selected_candidate != NO_ALLOCATION:
-            assert not bool(
-                next_action_mask[
-                    rbg_index,
-                    selected_candidate,
-                ]
-                .item()
-            )
-
-        # Final action is always NO-ALLOCATION.
-        assert bool(
-            next_action_mask[
-                rbg_index,
-                num_candidates,
-            ]
-            .item()
-        )
-
-    # ------------------------------------------------------------------
-    # Human-readable diagnostics
-    # ------------------------------------------------------------------
-
-    rank_list = []
-
-    for candidate_index in range(
-        num_candidates
-    ):
-        if bool(
-            candidate_valid_mask[
-                candidate_index
-            ]
-            .item()
-        ):
-            rank_value = int(
-                candidate_rank[
-                    candidate_index
-                ]
-                .item()
-            )
-
-            rank_list.append(
-                rank_value
-            )
-        else:
-            rank_list.append(
-                None
-            )
-
-    print()
-    print("Candidate ranks:")
-    print(rank_list)
-
-    wideband_cqi_list = (
-        cqi_features
-        .wideband_cqi
-        .detach()
-        .cpu()
-        .tolist()
     )
 
     print()
-    print("Candidate wideband CQIs:")
-    print(wideband_cqi_list)
+    print("=" * 72)
+    print("Complete 1LDS UE-Slot Loop")
+    print("=" * 72)
 
-    if num_valid_candidates > 0:
-        first_subband_cqi = (
-            cqi_features
-            .subband_cqi[
-                0,
-                :,
-            ]
-            .detach()
-            .cpu()
-            .tolist()
-        )
-
-        first_correlation = (
-            spatial_features
-            .max_precoder_cross_correlation[
-                0,
-                :,
-            ]
-            .detach()
-            .cpu()
-            .tolist()
-        )
-
-        print()
-        print("Candidate-0 sub-band CQIs:")
-        print(first_subband_cqi)
-
-        print()
-        print(
-            "Candidate-0 max precoder "
-            "cross-correlations:"
-        )
-
-        print(first_correlation)
-
-    print()
-    print("Valid-candidate correlation diagnostics:")
-
-    for candidate_index in range(
-        num_candidates
+    for user_slot_index in range(
+        num_user_slots
     ):
-        if not bool(
-            candidate_valid_mask[
-                candidate_index
+        decision = (
+            schedule_result
+            .decisions[
+                user_slot_index
             ]
-            .item()
-        ):
-            continue
+        )
 
-        correlation_values = (
-            spatial_features
-            .max_precoder_cross_correlation[
-                candidate_index,
+        actions = (
+            schedule_result
+            .actions[
+                user_slot_index,
                 :,
             ]
+        )
+
+        allocated_counts = (
+            decision
+            .spatial_features
+            .allocated_rbg_count
             .detach()
             .cpu()
             .tolist()
         )
 
         maximum_correlation = float(
-            spatial_features
-            .max_precoder_cross_correlation[
-                candidate_index,
-                :,
-            ]
+            decision
+            .spatial_features
+            .max_precoder_cross_correlation
             .max()
             .item()
         )
 
         print()
         print(
-            f"Candidate {candidate_index}:"
+            f"UE slot {user_slot_index}"
         )
 
         print(
-            "  max over RBGs = "
+            "  state shape:           "
+            f"{tuple(decision.state_data.state.shape)}"
+        )
+
+        print(
+            "  action-mask shape:     "
+            f"{tuple(decision.action_mask.shape)}"
+        )
+
+        print(
+            "  allocated counts "
+            "before action:"
+        )
+
+        print(
+            f"    {allocated_counts}"
+        )
+
+        print(
+            "  maximum correlation "
+            "before action: "
             f"{maximum_correlation:.6f}"
         )
 
         print(
-            "  per-RBG values = "
-            f"{correlation_values}"
+            "  chosen actions:"
         )
+
+        print(
+            "    "
+            f"{actions.detach().cpu().tolist()}"
+        )
+
+    final_allocation = (
+        schedule_result
+        .allocation
+    )
+
+    final_allocation_values = (
+        final_allocation
+        .candidate_by_user_slot
+        .detach()
+        .cpu()
+        .tolist()
+    )
 
     print()
     print("=" * 72)
-    print("Constructed 1LDS State")
+    print("Final 1LDS Candidate Allocation")
     print("=" * 72)
 
-    segment_shape = tuple(
-        state_data
-        .ue_feature_segments
-        .shape
-    )
-
-    state_shape = tuple(
-        state_data
-        .state
-        .shape
-    )
-
-    state_min = float(
-        state_data
-        .state
-        .min()
-        .item()
-    )
-
-    state_max = float(
-        state_data
-        .state
-        .max()
-        .item()
-    )
-
-    state_is_finite = bool(
-        torch.isfinite(
-            state_data.state
-        )
-        .all()
-        .item()
-    )
-
     print(
-        "UE feature segments:      "
-        f"{segment_shape}"
+        final_allocation_values
     )
 
-    print(
-        "Flattened state:           "
-        f"{state_shape}"
-    )
+    for rbg_index in range(
+        num_rbgs
+    ):
+        selected_candidates = []
 
-    print(
-        "State size:                "
-        f"{state_data.state.numel()}"
-    )
-
-    print(
-        "Expected actor outputs:    "
-        f"{state_config.actor_output_size}"
-    )
-
-    print(
-        "Next action-mask shape:    "
-        f"{tuple(next_action_mask.shape)}"
-    )
-
-    print(
-        "State minimum:             "
-        f"{state_min:.6f}"
-    )
-
-    print(
-        "State maximum:             "
-        f"{state_max:.6f}"
-    )
-
-    print(
-        "All state values finite:   "
-        f"{state_is_finite}"
-    )
-
-    if num_valid_candidates > 0:
-        print_first_candidate_features(
-            feature_segment=(
-                state_data
-                .ue_feature_segments[
-                    0
+        for user_slot_index in range(
+            num_user_slots
+        ):
+            candidate_index = int(
+                final_allocation
+                .candidate_by_user_slot[
+                    user_slot_index,
+                    rbg_index,
                 ]
-            ),
-            num_rbgs=num_rbgs,
+                .item()
+            )
+
+            if candidate_index == (
+                NO_ALLOCATION
+            ):
+                continue
+
+            selected_candidates.append(
+                candidate_index
+            )
+
+        assert len(
+            selected_candidates
+        ) == len(
+            set(
+                selected_candidates
+            )
         )
 
     print()
     print("=" * 72)
+    print("UE Slots vs Physical MIMO Streams")
+    print("=" * 72)
+
+    for rbg_index in range(
+        num_rbgs
+    ):
+        scheduled_ues = 0
+        physical_streams = 0
+
+        for user_slot_index in range(
+            num_user_slots
+        ):
+            candidate_index = int(
+                final_allocation
+                .candidate_by_user_slot[
+                    user_slot_index,
+                    rbg_index,
+                ]
+                .item()
+            )
+
+            if candidate_index == (
+                NO_ALLOCATION
+            ):
+                continue
+
+            scheduled_ues += 1
+
+            ue_rank = int(
+                candidate_rank[
+                    candidate_index
+                ]
+                .item()
+            )
+
+            physical_streams += (
+                ue_rank
+            )
+
+        print(
+            f"RBG {rbg_index:2d}: "
+            f"{scheduled_ues} scheduled UEs, "
+            f"{physical_streams} physical streams"
+        )
+    for decision in (
+        schedule_result.decisions
+    ):
+        assert tuple(
+            decision
+            .state_data
+            .state
+            .shape
+        ) == (
+            410,
+        )
+
+        assert tuple(
+            decision
+            .action_mask
+            .shape
+        ) == (
+            18,
+            11,
+        )
+
+        assert torch.isfinite(
+            decision
+            .state_data
+            .state
+        ).all()
+
+    print()
+    print("=" * 72)
     print(
-        "REAL 410-DIMENSIONAL "
-        "1LDS STATE SANITY PASSED"
+        "REAL COMPLETE 4-SLOT 1LDS "
+        "LOOP SANITY PASSED"
     )
     print("=" * 72)
 
     print()
+    print("Interpretation:")
+
     print(
-        "IMPORTANT REPRODUCTION NOTES:"
+        "- PF TDS supplies the UE candidate set."
     )
 
     print(
-        "- PF-based initial FDS is an "
-        "open-reproduction surrogate."
+        "- The 1LDS scheduler begins with an "
+        "empty allocation."
     )
 
     print(
-        "- SVD transmit directions are "
-        "PMI-direction surrogates."
+        "- One complete all-RBG decision is made "
+        "per scheduler UE slot."
     )
 
     print(
-        "- Recommended rank is an ideal-SVD "
-        "RI surrogate."
+        "- The state and action mask are rebuilt "
+        "after every UE-slot allocation."
     )
 
     print(
-        "- DL buffer and initial throughput "
-        "history are temporary placeholders."
+        "- A rank-2 UE is selected once but "
+        "represents two physical MIMO streams."
     )
 
     print(
-        "- The 21-UE population is a "
-        "memory-safe integration configuration."
+        "- The controlled callback is only an "
+        "integration-test policy, not RL."
     )
+
+    # allocation_0 = build_empty_cell_allocation(
+    #     num_user_slots=num_user_slots,
+    #     num_rbgs=num_rbgs,
+    #     device=device,
+    # )
+
+    # print()
+    # print("=" * 72)
+    # print("1LDS User-Slot 0 Decision")
+    # print("=" * 72)
+
+    # print()
+    # print("Allocation before slot 0:")
+    # print(
+    #     allocation_0
+    #     .candidate_by_user_slot
+    #     .detach()
+    #     .cpu()
+    #     .tolist()
+    # )
+
+
+    # decision_0 = build_1lds_decision_data(
+    #     allocation=allocation_0,
+    #     user_slot_index=0,
+    #     inputs=decision_inputs,
+    #     config=state_config,
+    # )
+
+    # assert tuple(
+    #     decision_0
+    #     .state_data
+    #     .state
+    #     .shape
+    # ) == (
+    #     410,
+    # )
+
+    # assert tuple(
+    #     decision_0
+    #     .action_mask
+    #     .shape
+    # ) == (
+    #     18,
+    #     11,
+    # )
+
+    # assert torch.all(
+    #     decision_0
+    #     .spatial_features
+    #     .allocated_rbg_count
+    #     == 0
+    # )
+
+    # assert torch.all(
+    #     decision_0
+    #     .spatial_features
+    #     .max_precoder_cross_correlation
+    #     == 0.0
+    # )
+
+    # print(
+    #     "state_0 shape:             "
+    #     f"{tuple(decision_0.state_data.state.shape)}"
+    # )
+
+    # print(
+    #     "action mask_0 shape:       "
+    #     f"{tuple(decision_0.action_mask.shape)}"
+    # )
+
+    # print(
+    #     "Allocated counts state_0:  "
+    #     f"{decision_0.spatial_features.allocated_rbg_count.detach().cpu().tolist()}"
+    # )
+
+    # print(
+    #     "Max correlation state_0:   "
+    #     f"{float(decision_0.spatial_features.max_precoder_cross_correlation.max().item()):.6f}"
+    # )
+
+    # if num_valid_candidates <= 0:
+    #     raise RuntimeError(
+    #         "Chosen cell has no valid PF candidates."
+    #     )
+
+    # controlled_actions = (
+    #     torch.arange(
+    #         num_rbgs,
+    #         device=device,
+    #         dtype=torch.long,
+    #     )
+    #     % num_valid_candidates
+    # )
+
+    # # Deliberately leave the final RBG unallocated.
+    # #
+    # # Actor convention:
+    # #     action == num_candidates
+    # # means NO ALLOCATION.
+    # controlled_actions[
+    #     -1
+    # ] = num_candidates
+
+    # print()
+    # print("Controlled slot-0 actor actions:")
+    # print(
+    #     controlled_actions
+    #     .detach()
+    #     .cpu()
+    #     .tolist()
+    # )
+
+    # allocation_1 = apply_user_slot_actions(
+    #     allocation=allocation_0,
+    #     user_slot_index=0,
+    #     actions=controlled_actions,
+    #     num_candidates=num_candidates,
+    #     candidate_valid_mask=(
+    #         candidate_valid_mask
+    #     ),
+    # )
+
+    # print()
+    # print("Allocation after slot 0:")
+    # print(
+    #     allocation_1
+    #     .candidate_by_user_slot
+    #     .detach()
+    #     .cpu()
+    #     .tolist()
+    # )
+
+    # decision_1 = build_1lds_decision_data(
+    #     allocation=allocation_1,
+    #     user_slot_index=1,
+    #     inputs=decision_inputs,
+    #     config=state_config,
+    # )
+
+    # assert tuple(
+    #     decision_1
+    #     .state_data
+    #     .state
+    #     .shape
+    # ) == (
+    #     410,
+    # )
+
+    # assert tuple(
+    #     decision_1
+    #     .action_mask
+    #     .shape
+    # ) == (
+    #     18,
+    #     11,
+    # )
+
+    # assert not torch.equal(
+    #     decision_0
+    #     .state_data
+    #     .state,
+    #     decision_1
+    #     .state_data
+    #     .state,
+    # )
+
+    # num_allocated_rbgs = int(
+    #     (
+    #         allocation_1
+    #         .candidate_by_user_slot[
+    #             0,
+    #             :,
+    #         ]
+    #         != NO_ALLOCATION
+    #     )
+    #     .sum()
+    #     .item()
+    # )
+
+    # assert num_allocated_rbgs == (
+    #     num_rbgs - 1
+    # )
+
+    # allocated_count_sum = int(
+    #     decision_1
+    #     .spatial_features
+    #     .allocated_rbg_count
+    #     .sum()
+    #     .item()
+    # )
+
+    # assert allocated_count_sum == (
+    #     num_allocated_rbgs
+    # )
+
+    # # The final RBG was deliberately left empty.
+    # assert int(
+    #     allocation_1
+    #     .candidate_by_user_slot[
+    #         0,
+    #         -1,
+    #     ]
+    #     .item()
+    # ) == NO_ALLOCATION
+
+    # # Therefore no candidate has an already-scheduled
+    # # pairing partner on the final RBG.
+    # assert torch.all(
+    #     decision_1
+    #     .spatial_features
+    #     .max_precoder_cross_correlation[
+    #         :,
+    #         -1,
+    #     ]
+    #     == 0.0
+    # )
+
+    # # NO ALLOCATION remains legal on every RBG.
+    # assert torch.all(
+    #     decision_1
+    #     .action_mask[
+    #         :,
+    #         num_candidates,
+    #     ]
+    # )
+
+
+    # for rbg_index in range(
+    #     num_rbgs - 1
+    # ):
+    #     selected_candidate = int(
+    #         allocation_1
+    #         .candidate_by_user_slot[
+    #             0,
+    #             rbg_index,
+    #         ]
+    #         .item()
+    #     )
+
+    #     assert selected_candidate != (
+    #         NO_ALLOCATION
+    #     )
+
+    #     assert not bool(
+    #         decision_1
+    #         .action_mask[
+    #             rbg_index,
+    #             selected_candidate,
+    #         ]
+    #         .item()
+    #     )
+
+    # print()
+    # print("=" * 72)
+    # print("1LDS User-Slot 1 Decision")
+    # print("=" * 72)
+
+    # state_1_counts = (
+    #     decision_1
+    #     .spatial_features
+    #     .allocated_rbg_count
+    #     .detach()
+    #     .cpu()
+    #     .tolist()
+    # )
+
+    # print(
+    #     "state_1 shape:             "
+    #     f"{tuple(decision_1.state_data.state.shape)}"
+    # )
+
+    # print(
+    #     "action mask_1 shape:       "
+    #     f"{tuple(decision_1.action_mask.shape)}"
+    # )
+
+    # print()
+    # print("Allocated RBG counts in state_1:")
+    # print(state_1_counts)
+
+    # print()
+    # print(
+    #     "Per-candidate max correlation "
+    #     "after slot 0:"
+    # )
+
+    # for candidate_index in range(
+    #     num_candidates
+    # ):
+    #     if not bool(
+    #         candidate_valid_mask[
+    #             candidate_index
+    #         ].item()
+    #     ):
+    #         continue
+
+    #     correlation = (
+    #         decision_1
+    #         .spatial_features
+    #         .max_precoder_cross_correlation[
+    #             candidate_index,
+    #             :,
+    #         ]
+    #     )
+
+    #     maximum_value = float(
+    #         correlation.max().item()
+    #     )
+
+    #     print(
+    #         f"Candidate {candidate_index}: "
+    #         f"{maximum_value:.6f}"
+    #     )
+
+
+    # if num_valid_candidates > 0:
+    #     print()
+    #     print(
+    #         "Candidate-0 feature segment "
+    #         "BEFORE slot-0 action:"
+    #     )
+
+    #     print_first_candidate_features(
+    #         feature_segment=(
+    #             decision_0
+    #             .state_data
+    #             .ue_feature_segments[
+    #                 0
+    #             ]
+    #         ),
+    #         num_rbgs=num_rbgs,
+    #     )
+
+    #     print()
+    #     print(
+    #         "Candidate-0 feature segment "
+    #         "AFTER slot-0 action:"
+    #     )
+
+    #     print_first_candidate_features(
+    #         feature_segment=(
+    #             decision_1
+    #             .state_data
+    #             .ue_feature_segments[
+    #                 0
+    #             ]
+    #         ),
+    #         num_rbgs=num_rbgs,
+    #     )
+
+    # print()
+    # print("=" * 72)
+    # print(
+    #     "REAL 1LDS STATE -> ACTION -> "
+    #     "NEXT-STATE SANITY PASSED"
+    # )
+    # print("=" * 72)
+
+    # print()
+    # print("Interpretation:")
+
+    # print(
+    #     "- state_0 is built from an EMPTY "
+    #     "deep-scheduler allocation."
+    # )
+
+    # print(
+    #     "- controlled_actions stand in for "
+    #     "the future actor output."
+    # )
+
+    # print(
+    #     "- allocation slot 0 is updated from "
+    #     "those actions."
+    # )
+
+    # print(
+    #     "- state_1 is rebuilt from the updated "
+    #     "allocation."
+    # )
+
+    # print(
+    #     "- allocated-RBG count, correlation, "
+    #     "and action mask evolve automatically."
+    # )
+
+    # print()
+    # print("Reproduction notes:")
+
+    # print(
+    #     "- No PF-based FDS allocation initializes "
+    #     "the deep scheduler."
+    # )
+
+    # print(
+    #     "- SVD transmit directions remain "
+    #     "PMI-direction surrogates."
+    # )
+
+    # print(
+    #     "- Recommended rank remains an ideal-SVD "
+    #     "RI surrogate."
+    # )
+
+    # print(
+    #     "- DL buffer and initial throughput history "
+    #     "remain temporary placeholders."
+    # )
+
+
+
+               
+
+    # raw_features = OneLDSRawFeatures(
+    #     past_average_throughput=(
+    #         candidate_history
+    #     ),
+    #     rank=candidate_rank,
+    #     allocated_rbg_count=(
+    #         spatial_features
+    #         .allocated_rbg_count
+    #     ),
+    #     dl_buffer=dl_buffer,
+    #     wideband_cqi=(
+    #         cqi_features
+    #         .wideband_cqi
+    #     ),
+    #     subband_cqi=(
+    #         cqi_features
+    #         .subband_cqi
+    #     ),
+    #     max_precoder_cross_correlation=(
+    #         spatial_features
+    #         .max_precoder_cross_correlation
+    #     ),
+    #     candidate_valid_mask=(
+    #         candidate_valid_mask
+    #     ),
+    # )
+
+    # state_data = build_1lds_state(
+    #     features=raw_features,
+    #     config=state_config,
+    # )
+
+    # # ------------------------------------------------------------------
+    # # State validation
+    # # ------------------------------------------------------------------
+
+    # expected_segment_shape = (
+    #     num_candidates,
+    #     41,
+    # )
+
+    # expected_state_shape = (
+    #     410,
+    # )
+
+    # assert tuple(
+    #     state_data
+    #     .ue_feature_segments
+    #     .shape
+    # ) == expected_segment_shape
+
+    # assert tuple(
+    #     state_data
+    #     .state
+    #     .shape
+    # ) == expected_state_shape
+
+    # assert state_config.ue_feature_size == 41
+    # assert state_config.state_size == 410
+    # assert state_config.actor_output_size == 198
+
+    # assert torch.isfinite(
+    #     state_data.state
+    # ).all()
+
+    # invalid_candidate_mask = (
+    #     ~candidate_valid_mask
+    # )
+
+    # if bool(
+    #     invalid_candidate_mask.any().item()
+    # ):
+    #     invalid_segments = (
+    #         state_data
+    #         .ue_feature_segments[
+    #             invalid_candidate_mask
+    #         ]
+    #     )
+
+    #     assert torch.all(
+    #         invalid_segments == 0.0
+    #     )
+
+    # # ------------------------------------------------------------------
+    # # Existing allocation -> next 1LDS user-slot action mask
+    # # ------------------------------------------------------------------
+
+    # next_action_mask = (
+    #     build_next_user_slot_action_mask(
+    #         allocation=allocation,
+    #         num_candidates=num_candidates,
+    #         user_slot_index=1,
+    #         candidate_valid_mask=(
+    #             candidate_valid_mask
+    #         ),
+    #     )
+    # )
+
+    # assert tuple(
+    #     next_action_mask.shape
+    # ) == (
+    #     num_rbgs,
+    #     num_candidates + 1,
+    # )
+
+    # for rbg_index in range(
+    #     num_rbgs
+    # ):
+    #     selected_candidate = int(
+    #         slot_zero[
+    #             rbg_index
+    #         ]
+    #         .item()
+    #     )
+
+    #     if selected_candidate != NO_ALLOCATION:
+    #         assert not bool(
+    #             next_action_mask[
+    #                 rbg_index,
+    #                 selected_candidate,
+    #             ]
+    #             .item()
+    #         )
+
+    #     # Final action is always NO-ALLOCATION.
+    #     assert bool(
+    #         next_action_mask[
+    #             rbg_index,
+    #             num_candidates,
+    #         ]
+    #         .item()
+    #     )
+
+    # # ------------------------------------------------------------------
+    # # Human-readable diagnostics
+    # # ------------------------------------------------------------------
+
+    # rank_list = []
+
+    # for candidate_index in range(
+    #     num_candidates
+    # ):
+    #     if bool(
+    #         candidate_valid_mask[
+    #             candidate_index
+    #         ]
+    #         .item()
+    #     ):
+    #         rank_value = int(
+    #             candidate_rank[
+    #                 candidate_index
+    #             ]
+    #             .item()
+    #         )
+
+    #         rank_list.append(
+    #             rank_value
+    #         )
+    #     else:
+    #         rank_list.append(
+    #             None
+    #         )
+
+    # print()
+    # print("Candidate ranks:")
+    # print(rank_list)
+
+    # wideband_cqi_list = (
+    #     cqi_features
+    #     .wideband_cqi
+    #     .detach()
+    #     .cpu()
+    #     .tolist()
+    # )
+
+    # print()
+    # print("Candidate wideband CQIs:")
+    # print(wideband_cqi_list)
+
+    # if num_valid_candidates > 0:
+    #     first_subband_cqi = (
+    #         cqi_features
+    #         .subband_cqi[
+    #             0,
+    #             :,
+    #         ]
+    #         .detach()
+    #         .cpu()
+    #         .tolist()
+    #     )
+
+    #     first_correlation = (
+    #         spatial_features
+    #         .max_precoder_cross_correlation[
+    #             0,
+    #             :,
+    #         ]
+    #         .detach()
+    #         .cpu()
+    #         .tolist()
+    #     )
+
+    #     print()
+    #     print("Candidate-0 sub-band CQIs:")
+    #     print(first_subband_cqi)
+
+    #     print()
+    #     print(
+    #         "Candidate-0 max precoder "
+    #         "cross-correlations:"
+    #     )
+
+    #     print(first_correlation)
+
+    # print()
+    # print("Valid-candidate correlation diagnostics:")
+
+    # for candidate_index in range(
+    #     num_candidates
+    # ):
+    #     if not bool(
+    #         candidate_valid_mask[
+    #             candidate_index
+    #         ]
+    #         .item()
+    #     ):
+    #         continue
+
+    #     correlation_values = (
+    #         spatial_features
+    #         .max_precoder_cross_correlation[
+    #             candidate_index,
+    #             :,
+    #         ]
+    #         .detach()
+    #         .cpu()
+    #         .tolist()
+    #     )
+
+    #     maximum_correlation = float(
+    #         spatial_features
+    #         .max_precoder_cross_correlation[
+    #             candidate_index,
+    #             :,
+    #         ]
+    #         .max()
+    #         .item()
+    #     )
+
+    #     print()
+    #     print(
+    #         f"Candidate {candidate_index}:"
+    #     )
+
+    #     print(
+    #         "  max over RBGs = "
+    #         f"{maximum_correlation:.6f}"
+    #     )
+
+    #     print(
+    #         "  per-RBG values = "
+    #         f"{correlation_values}"
+    #     )
+
+    # print()
+    # print("=" * 72)
+    # print("Constructed 1LDS State")
+    # print("=" * 72)
+
+    # segment_shape = tuple(
+    #     state_data
+    #     .ue_feature_segments
+    #     .shape
+    # )
+
+    # state_shape = tuple(
+    #     state_data
+    #     .state
+    #     .shape
+    # )
+
+    # state_min = float(
+    #     state_data
+    #     .state
+    #     .min()
+    #     .item()
+    # )
+
+    # state_max = float(
+    #     state_data
+    #     .state
+    #     .max()
+    #     .item()
+    # )
+
+    # state_is_finite = bool(
+    #     torch.isfinite(
+    #         state_data.state
+    #     )
+    #     .all()
+    #     .item()
+    # )
+
+    # print(
+    #     "UE feature segments:      "
+    #     f"{segment_shape}"
+    # )
+
+    # print(
+    #     "Flattened state:           "
+    #     f"{state_shape}"
+    # )
+
+    # print(
+    #     "State size:                "
+    #     f"{state_data.state.numel()}"
+    # )
+
+    # print(
+    #     "Expected actor outputs:    "
+    #     f"{state_config.actor_output_size}"
+    # )
+
+    # print(
+    #     "Next action-mask shape:    "
+    #     f"{tuple(next_action_mask.shape)}"
+    # )
+
+    # print(
+    #     "State minimum:             "
+    #     f"{state_min:.6f}"
+    # )
+
+    # print(
+    #     "State maximum:             "
+    #     f"{state_max:.6f}"
+    # )
+
+    # print(
+    #     "All state values finite:   "
+    #     f"{state_is_finite}"
+    # )
+
+    # if num_valid_candidates > 0:
+    #     print_first_candidate_features(
+    #         feature_segment=(
+    #             state_data
+    #             .ue_feature_segments[
+    #                 0
+    #             ]
+    #         ),
+    #         num_rbgs=num_rbgs,
+    #     )
+
+    # print()
+    # print("=" * 72)
+    # print(
+    #     "REAL 410-DIMENSIONAL "
+    #     "1LDS STATE SANITY PASSED"
+    # )
+    # print("=" * 72)
+
+    # print()
+    # print(
+    #     "IMPORTANT REPRODUCTION NOTES:"
+    # )
+
+    # print(
+    #     "- PF-based initial FDS is an "
+    #     "open-reproduction surrogate."
+    # )
+
+    # print(
+    #     "- SVD transmit directions are "
+    #     "PMI-direction surrogates."
+    # )
+
+    # print(
+    #     "- Recommended rank is an ideal-SVD "
+    #     "RI surrogate."
+    # )
+
+    # print(
+    #     "- DL buffer and initial throughput "
+    #     "history are temporary placeholders."
+    # )
+
+    # print(
+    #     "- The 21-UE population is a "
+    #     "memory-safe integration configuration."
+    # )
 
 
 if __name__ == "__main__":

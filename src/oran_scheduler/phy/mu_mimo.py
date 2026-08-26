@@ -101,6 +101,15 @@ class MUMIMOLayerSINRData:
 
     sinr_linear: torch.Tensor
 
+    # For the newer physical post-precoder-MRC path,
+    # this stores the actual receive combiner:
+    #
+    #     f_l = H g_l / ||H g_l||
+    #
+    # Older helpers that use an externally supplied
+    # combiner may leave this as None.
+    mrc_combiner: torch.Tensor | None = None
+
 def compute_mu_mimo_layer_sinr(
     layer_physical_channel: torch.Tensor,
     layer_rx_combiner: torch.Tensor,
@@ -683,6 +692,350 @@ def evaluate_mu_mimo_layer_sinr_with_precoder(
         sinr_linear=sinr_linear,
     )
 
+
+def evaluate_mu_mimo_layer_sinr_with_post_precoder_mrc(
+    layer_physical_channel: torch.Tensor,
+    precoding_matrix: torch.Tensor,
+    total_tx_power_w: float | torch.Tensor,
+    noise_power_w: float | torch.Tensor,
+    inter_cell_covariance: torch.Tensor | None = None,
+) -> MUMIMOLayerSINRData:
+    """
+    Evaluate one fixed MU-MIMO precoder using actual
+    post-precoder MRC on every physical channel realization.
+
+    Args:
+        layer_physical_channel:
+            [
+                ...,
+                layer,
+                RX_ant,
+                TX_ant,
+            ]
+
+        precoding_matrix:
+            [
+                TX_ant,
+                layer,
+            ]
+
+            One fixed precoder, normally RZF computed from
+            the representative CSI snapshot of this RBG.
+
+        total_tx_power_w:
+            Total serving-BS power available on each
+            evaluated subcarrier.
+
+        noise_power_w:
+            Noise power per physical RX branch.
+
+        inter_cell_covariance:
+            Optional:
+            [
+                ...,
+                layer,
+                RX_ant,
+                RX_ant,
+            ]
+
+    Important:
+        The RZF precoder remains fixed.
+
+        The receive MRC vector does NOT remain fixed.
+
+        For every physical channel realization and layer:
+
+            f_l = H_l g_l / ||H_l g_l||
+
+        This matches the intended MRC interpretation after
+        the transmit precoder has been selected.
+    """
+
+    if layer_physical_channel.ndim < 3:
+        raise ValueError(
+            "layer_physical_channel must end with "
+            "[layer, RX_ant, TX_ant]."
+        )
+
+    if not torch.is_complex(
+        layer_physical_channel
+    ):
+        raise ValueError(
+            "layer_physical_channel must be complex-valued."
+        )
+
+    num_layers = (
+        layer_physical_channel.shape[-3]
+    )
+
+    num_rx_ant = (
+        layer_physical_channel.shape[-2]
+    )
+
+    num_tx_ant = (
+        layer_physical_channel.shape[-1]
+    )
+
+    if num_layers <= 0:
+        raise ValueError(
+            "At least one physical layer is required."
+        )
+
+    if tuple(
+        precoding_matrix.shape
+    ) != (
+        num_tx_ant,
+        num_layers,
+    ):
+        raise ValueError(
+            "precoding_matrix must have shape "
+            "[TX_ant, layer]."
+        )
+
+    if not torch.is_complex(
+        precoding_matrix
+    ):
+        raise ValueError(
+            "precoding_matrix must be complex-valued."
+        )
+
+    # Apply every transmit beam to every layer-owner's
+    # physical channel.
+    #
+    # Result:
+    #
+    #     [..., layer, RX_ant, transmit_layer]
+    #
+    precoded_spatial_channel = torch.matmul(
+        layer_physical_channel,
+        precoding_matrix,
+    )
+
+    # Extract each layer's DESIRED post-precoding
+    # spatial channel:
+    #
+    #     H_l g_l
+    #
+    # Result:
+    #
+    #     [..., layer, RX_ant]
+    #
+    desired_spatial_channel = (
+        torch.diagonal(
+            precoded_spatial_channel,
+            dim1=-3,
+            dim2=-1,
+        )
+        .movedim(
+            -1,
+            -2,
+        )
+    )
+
+    desired_norm = torch.linalg.vector_norm(
+        desired_spatial_channel,
+        dim=-1,
+        keepdim=True,
+    )
+
+    if torch.any(
+        desired_norm <= 0
+    ):
+        raise ValueError(
+            "A desired post-precoder channel "
+            "has zero norm."
+        )
+
+    # PAPER-SPECIFIED receiver type: MRC.
+    #
+    # OPEN implementation of the physical MRC:
+    #
+    #     f_l = H_l g_l / ||H_l g_l||
+    #
+    mrc_combiner = (
+        desired_spatial_channel
+        / desired_norm
+    )
+
+    # Effective physical channel after the actual
+    # post-precoder MRC direction has been determined.
+    effective_channel = torch.einsum(
+        "...lr,...lrt->...lt",
+        mrc_combiner.conj(),
+        layer_physical_channel,
+    )
+
+    # Observe ALL serving-cell transmit streams through
+    # each layer's MRC receiver.
+    #
+    # Result:
+    #
+    #     [..., receive_layer, transmit_layer]
+    #
+    combined_channel = torch.einsum(
+        "...lr,...lrj->...lj",
+        mrc_combiner.conj(),
+        precoded_spatial_channel,
+    )
+
+    total_tx_power = torch.as_tensor(
+        total_tx_power_w,
+        dtype=(
+            layer_physical_channel.real.dtype
+        ),
+        device=layer_physical_channel.device,
+    )
+
+    if torch.any(
+        total_tx_power <= 0
+    ):
+        raise ValueError(
+            "total_tx_power_w must be positive."
+        )
+
+    # OPEN-REPRODUCTION ASSUMPTION:
+    # equal power across active PHYSICAL streams.
+    per_layer_power = (
+        total_tx_power
+        / float(num_layers)
+    )
+
+    stream_power_shape = (
+        layer_physical_channel.shape[:-3]
+        + (
+            num_layers,
+        )
+    )
+
+    stream_power_w = torch.broadcast_to(
+        per_layer_power,
+        stream_power_shape,
+    )
+
+    combined_power = (
+        torch.abs(
+            combined_channel
+        )
+        ** 2
+    )
+
+    combined_power = (
+        combined_power
+        * stream_power_w.unsqueeze(-2)
+    )
+
+    desired_power = torch.diagonal(
+        combined_power,
+        dim1=-2,
+        dim2=-1,
+    )
+
+    total_serving_power = (
+        combined_power.sum(
+            dim=-1
+        )
+    )
+
+    intra_cell_interference_power = (
+        total_serving_power
+        - desired_power
+    )
+
+
+    noise_power = torch.as_tensor(
+        noise_power_w,
+        dtype=(
+            layer_physical_channel.real.dtype
+        ),
+        device=layer_physical_channel.device,
+    )
+
+    if torch.any(
+        noise_power < 0
+    ):
+        raise ValueError(
+            "noise_power_w cannot be negative."
+        )
+
+    noise_power = torch.broadcast_to(
+        noise_power,
+        stream_power_shape,
+    )
+
+    if inter_cell_covariance is None:
+        inter_cell_interference_power = (
+            torch.zeros_like(
+                desired_power
+            )
+        )
+
+    else:
+        expected_covariance_shape = (
+            layer_physical_channel.shape[:-1]
+            + (
+                num_rx_ant,
+            )
+        )
+
+        if tuple(
+            inter_cell_covariance.shape
+        ) != expected_covariance_shape:
+            raise ValueError(
+                "inter_cell_covariance must have shape "
+                "[..., layer, RX_ant, RX_ant]."
+            )
+
+        inter_cell_interference_power = (
+            torch.einsum(
+                "...lr,...lrs,...ls->...l",
+                mrc_combiner.conj(),
+                inter_cell_covariance,
+                mrc_combiner,
+            )
+            .real
+        )
+
+        inter_cell_interference_power = (
+            torch.clamp(
+                inter_cell_interference_power,
+                min=0.0,
+            )
+        )
+
+    denominator = (
+        intra_cell_interference_power
+        + inter_cell_interference_power
+        + noise_power
+    )
+
+    if torch.any(
+        denominator <= 0
+    ):
+        raise ValueError(
+            "SINR denominator must be positive."
+        )
+
+    sinr_linear = (
+        desired_power
+        / denominator
+    )
+
+    return MUMIMOLayerSINRData(
+        effective_channel=effective_channel,
+        precoding_matrix=precoding_matrix,
+        combined_channel=combined_channel,
+        stream_power_w=stream_power_w,
+        desired_power=desired_power,
+        intra_cell_interference_power=(
+            intra_cell_interference_power
+        ),
+        inter_cell_interference_power=(
+            inter_cell_interference_power
+        ),
+        noise_power=noise_power,
+        sinr_linear=sinr_linear,
+        mrc_combiner=mrc_combiner,
+    )
 
 
 

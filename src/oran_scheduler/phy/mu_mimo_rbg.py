@@ -5,7 +5,7 @@ import torch
 from oran_scheduler.phy.mu_mimo import (
     MUMIMOLayerSINRData,
     compute_rzf_matrix,
-    evaluate_mu_mimo_layer_sinr_with_precoder,
+    evaluate_mu_mimo_layer_sinr_with_post_precoder_mrc,
 )
 
 @dataclass
@@ -358,13 +358,21 @@ def evaluate_selected_users_on_rbg(
             .contiguous()
         )
 
+    # Important distinction:
+    #
+    # `layer_rx_combiner` above is the CSI-side
+    # SVD receive direction used to form effective
+    # CSI for RZF design.
+    #
+    # It is NOT reused as the physical receiver
+    # after RZF.
+    #
+    # The final physical receiver is MRC aligned
+    # to the actual post-precoding channel H(f) g_l.
     sinr_data = (
-        evaluate_mu_mimo_layer_sinr_with_precoder(
+        evaluate_mu_mimo_layer_sinr_with_post_precoder_mrc(
             layer_physical_channel=(
                 layer_physical_channel
-            ),
-            layer_rx_combiner=(
-                layer_rx_combiner
             ),
             precoding_matrix=(
                 precoding_matrix
