@@ -34,6 +34,10 @@ from oran_scheduler.schedulers.allocation import (
 from oran_scheduler.schedulers.one_lds_loop import (
     run_1lds_user_slot_loop,
 )
+
+from oran_scheduler.schedulers.throughput_history import (
+    update_cell_throughput_history,
+)
 # from oran_scheduler.schedulers.classical_frontend import (
 #     build_classical_initial_cell_allocation,
 #     run_classical_frontend,
@@ -205,6 +209,21 @@ def main() -> None:
     # The paper specifies the past-throughput feature but
     # does not publish the complete initialization procedure.
     initial_history_bps = 1.0e6
+
+    # OPEN-REPRODUCTION PARAMETER.
+    #
+    # The paper specifies exponential smoothing of
+    # past average throughput but does not publicly
+    # provide the exact epsilon used by the simulator.
+    #
+    # For this integration sanity we use:
+    #
+    #     R_new
+    #       =
+    #     (1 - epsilon) * delivered_rate
+    #     + epsilon * R_old
+    #
+    history_forgetting_factor = 0.95
 
     # TEMPORARY full-buffer-like placeholder.
     #
@@ -1804,6 +1823,253 @@ def main() -> None:
             f"{candidate_rate_mbps:.6f} Mbps"
         )
 
+    # ------------------------------------------------------------------
+    # Realized PHY throughput -> next-TTI throughput history
+    # ------------------------------------------------------------------
+
+    chosen_cell_candidate_indices = (
+        tds_result
+        .candidate_indices[
+            0,
+            cell_index,
+            :,
+        ]
+    )
+
+    chosen_cell_previous_history = (
+        past_average_throughput[
+            0,
+            cell_index,
+            :,
+        ]
+    )
+
+    chosen_cell_serving_valid_mask = (
+        serving_data
+        .valid_ue_mask[
+            0,
+            cell_index,
+            :,
+        ]
+    )
+
+    history_update = update_cell_throughput_history(
+        previous_average_throughput_bps=(
+            chosen_cell_previous_history
+        ),
+        serving_ue_valid_mask=(
+            chosen_cell_serving_valid_mask
+        ),
+        candidate_indices=(
+            chosen_cell_candidate_indices
+        ),
+        candidate_valid_mask=(
+            candidate_valid_mask
+        ),
+        candidate_delivered_rate_bps=(
+            candidate_total_rate_bps
+        ),
+        forgetting_factor=(
+            history_forgetting_factor
+        ),
+    )
+
+    assert tuple(
+        history_update
+        .delivered_rate_bps
+        .shape
+    ) == tuple(
+        chosen_cell_previous_history.shape
+    )
+
+    assert tuple(
+        history_update
+        .updated_average_throughput_bps
+        .shape
+    ) == tuple(
+        chosen_cell_previous_history.shape
+    )
+
+    assert torch.isfinite(
+        history_update
+        .delivered_rate_bps
+    ).all()
+
+    assert torch.isfinite(
+        history_update
+        .updated_average_throughput_bps
+    ).all()
+
+    assert torch.all(
+        history_update
+        .delivered_rate_bps
+        >= 0.0
+    )
+
+    assert torch.all(
+        history_update
+        .updated_average_throughput_bps
+        >= 0.0
+    )
+
+    expected_updated_history = (
+        (
+            1.0
+            - history_forgetting_factor
+        )
+        * history_update.delivered_rate_bps
+        + history_forgetting_factor
+        * chosen_cell_previous_history
+    )
+
+    expected_updated_history = torch.where(
+        chosen_cell_serving_valid_mask,
+        expected_updated_history,
+        torch.zeros_like(
+            expected_updated_history
+        ),
+    )
+
+    torch.testing.assert_close(
+        history_update
+        .updated_average_throughput_bps,
+        expected_updated_history,
+    )
+
+    print()
+    print("=" * 72)
+    print("Throughput History: TTI t -> TTI t+1")
+    print("=" * 72)
+
+    print(
+        "Forgetting factor epsilon: "
+        f"{history_forgetting_factor:.4f}"
+    )
+
+    print()
+    print(
+        "History is shown in the persistent "
+        "serving-UE-slot order."
+    )
+    chosen_cell_global_ue_indices = (
+        serving_data
+        .global_ue_indices[
+            0,
+            cell_index,
+            :,
+        ]
+    )
+
+    num_serving_slots = (
+        chosen_cell_previous_history.shape[0]
+    )
+
+    for serving_slot_index in range(
+        num_serving_slots
+    ):
+        if not bool(
+            chosen_cell_serving_valid_mask[
+                serving_slot_index
+            ]
+            .item()
+        ):
+            continue
+
+        global_ue_index = int(
+            chosen_cell_global_ue_indices[
+                serving_slot_index
+            ]
+            .item()
+        )
+
+        previous_history_mbps = float(
+            chosen_cell_previous_history[
+                serving_slot_index
+            ]
+            .item()
+            / 1.0e6
+        )
+
+        delivered_rate_mbps = float(
+            history_update
+            .delivered_rate_bps[
+                serving_slot_index
+            ]
+            .item()
+            / 1.0e6
+        )
+
+        updated_history_mbps = float(
+            history_update
+            .updated_average_throughput_bps[
+                serving_slot_index
+            ]
+            .item()
+            / 1.0e6
+        )
+
+        print()
+        print(
+            f"Serving slot {serving_slot_index}, "
+            f"global UE {global_ue_index}"
+        )
+
+        print(
+            "  previous history:      "
+            f"{previous_history_mbps:.6f} Mbps"
+        )
+
+        print(
+            "  delivered this TTI:    "
+            f"{delivered_rate_mbps:.6f} Mbps"
+        )
+
+        print(
+            "  history for next TTI:  "
+            f"{updated_history_mbps:.6f} Mbps"
+        )
+
+    next_tti_past_average_throughput = (
+        past_average_throughput.clone()
+    )
+
+    next_tti_past_average_throughput[
+        0,
+        cell_index,
+        :,
+    ] = (
+        history_update
+        .updated_average_throughput_bps
+    )
+
+    assert tuple(
+        next_tti_past_average_throughput.shape
+    ) == tuple(
+        past_average_throughput.shape
+    )
+
+
+
+    # print(
+    #     "- epsilon = 0.95 is currently an "
+    #     "open-reproduction parameter."
+    # )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
     total_cell_rate_mbps = float(
         allocation_evaluation
         .total_cell_target_compliant_rate_bps
@@ -1873,6 +2139,23 @@ def main() -> None:
         "  -> per-UE and cell throughput"
     )
 
+    print(
+        "  -> per-UE and cell throughput"
+    )
+
+
+    print(
+        "  -> serving-UE delivered throughput"
+    )
+
+    print(
+        "  -> updated past-average throughput"
+    )
+
+    print(
+        "  -> history ready for the next TTI"
+    )
+
     print()
     print("IMPORTANT:")
 
@@ -1886,9 +2169,24 @@ def main() -> None:
         "surrogates."
     )
 
+    # print(
+    #     "- Current throughput history and buffer "
+    #     "values remain temporary placeholders."
+    # )
+
     print(
-        "- Current throughput history and buffer "
-        "values remain temporary placeholders."
+        "- Initial throughput history and epsilon "
+        "remain open-reproduction choices."
+    )
+
+    print(
+        "- DL buffer values remain temporary "
+        "placeholders."
+    )
+
+    print(
+        "- epsilon = 0.95 is currently an "
+        "open-reproduction parameter."
     )
 
 
