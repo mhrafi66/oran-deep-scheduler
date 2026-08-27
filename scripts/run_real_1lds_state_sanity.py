@@ -95,6 +95,18 @@ from oran_scheduler.state.one_lds_decision import (
     build_1lds_decision_data,
 )
 
+from oran_scheduler.rl.ppo_greedy_search import (
+    PPOGreedySearchConfig,
+    evaluate_ppo_schedule_greedy_search,
+)
+from oran_scheduler.rl.ppo_physical_score import (
+    CachedPPOPhysicalRBGScorer,
+    PPOPhysicalScoreInputs,
+)
+from oran_scheduler.rl.ppo_reward import (
+    build_greedy_indicator,
+)
+
 def print_first_candidate_features(
     feature_segment: torch.Tensor,
     num_rbgs: int,
@@ -1414,6 +1426,242 @@ def main() -> None:
             .state_data
             .state
         ).all()
+
+
+    physical_reward_scorer = (
+        CachedPPOPhysicalRBGScorer(
+            PPOPhysicalScoreInputs(
+                candidate_global_ue_indices=(
+                    candidate_global_ue_indices
+                ),
+                h_freq=channel.h_freq,
+                serving_cell_index=(
+                    cell_index
+                ),
+                recommended_rank=(
+                    csi_data
+                    .recommended_rank
+                ),
+                rx_combiners=(
+                    csi_data
+                    .rx_combiners
+                ),
+                csi_subcarrier_index=(
+                    csi_data
+                    .csi_subcarrier_index
+                ),
+                subcarriers_per_rbg=(
+                    rbg_config
+                    .subcarriers_per_rbg
+                ),
+                tx_power_per_subcarrier_w=(
+                    tx_power_per_subcarrier_w
+                ),
+                noise_power_per_subcarrier_w=(
+                    noise_power_per_subcarrier_w
+                ),
+                link_adaptation_config=(
+                    link_adaptation_config
+                ),
+                rate_config=rate_config,
+                batch_index=0,
+            )
+        )
+    )
+
+    ppo_greedy_search = (
+        evaluate_ppo_schedule_greedy_search(
+            actions=(
+                schedule_result.actions
+            ),
+            num_candidates=num_candidates,
+            past_average_throughput=(
+                candidate_history
+            ),
+            candidate_valid_mask=(
+                candidate_valid_mask
+            ),
+            score_rbg=(
+                physical_reward_scorer
+            ),
+            config=(
+                PPOGreedySearchConfig()
+            ),
+        )
+    )
+
+    torch.testing.assert_close(
+        ppo_greedy_search
+        .allocation
+        .candidate_by_user_slot,
+        final_allocation
+        .candidate_by_user_slot,
+    )
+
+    greedy_indicator = (
+        build_greedy_indicator(
+            better_allocation_exists=(
+                ppo_greedy_search
+                .better_allocation_exists
+            ),
+            dtype=torch.float32,
+        )
+    )
+
+    assert tuple(
+        ppo_greedy_search
+        .better_allocation_exists
+        .shape
+    ) == (
+        num_user_slots,
+        num_rbgs,
+    )
+
+    assert tuple(
+        greedy_indicator.shape
+    ) == (
+        num_user_slots,
+        num_rbgs,
+    )
+
+
+    print()
+    print("=" * 72)
+    print("Real PHY PPO Greedy Reward Search")
+    print("=" * 72)
+
+    better_matrix = (
+        ppo_greedy_search
+        .better_allocation_exists
+        .detach()
+        .cpu()
+    )
+
+    indicator_matrix = (
+        greedy_indicator
+        .detach()
+        .cpu()
+    )
+
+    for user_slot_index in range(
+        num_user_slots
+    ):
+        num_better = int(
+            better_matrix[
+                user_slot_index,
+                :,
+            ]
+            .sum()
+            .item()
+        )
+
+        print()
+        print(
+            f"UE slot {user_slot_index}"
+        )
+
+        print(
+            "  better PF alternative exists:"
+        )
+
+        print(
+            "    "
+            f"{better_matrix[user_slot_index].tolist()}"
+        )
+
+        print(
+            "  greedy indicator v:"
+        )
+
+        print(
+            "    "
+            f"{indicator_matrix[user_slot_index].tolist()}"
+        )
+
+        print(
+            "  RBGs penalized:        "
+            f"{num_better} / {num_rbgs}"
+        )
+
+
+    print()
+    print(
+        "Greedy score requests:     "
+        f"{ppo_greedy_search.num_phy_evaluations}"
+    )
+
+    print(
+        "Scorer requests observed:  "
+        f"{physical_reward_scorer.num_score_requests}"
+    )
+
+    print(
+        "Unique real PHY evaluations:"
+        f" {physical_reward_scorer.num_unique_phy_evaluations}"
+    )
+
+    assert (
+        physical_reward_scorer
+        .num_score_requests
+        ==
+        ppo_greedy_search
+        .num_phy_evaluations
+    )
+
+    assert (
+        physical_reward_scorer
+        .num_unique_phy_evaluations
+        <=
+        physical_reward_scorer
+        .num_score_requests
+    )
+
+    print()
+    print("Chosen PF sum -> best PF sum:")
+
+    for user_slot_index in range(
+        num_user_slots
+    ):
+        print()
+        print(
+            f"UE slot {user_slot_index}:"
+        )
+
+        for rbg_index in range(
+            num_rbgs
+        ):
+            chosen_pf = float(
+                ppo_greedy_search
+                .chosen_pf_sum[
+                    user_slot_index,
+                    rbg_index,
+                ]
+                .item()
+            )
+
+            best_pf = float(
+                ppo_greedy_search
+                .best_pf_sum[
+                    user_slot_index,
+                    rbg_index,
+                ]
+                .item()
+            )
+
+            indicator = int(
+                greedy_indicator[
+                    user_slot_index,
+                    rbg_index,
+                ]
+                .item()
+            )
+
+            print(
+                f"  RBG {rbg_index:2d}: "
+                f"{chosen_pf:.6f} -> "
+                f"{best_pf:.6f}, "
+                f"v={indicator:+d}"
+            )   
 
 
     # ------------------------------------------------------------------
