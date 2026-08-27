@@ -5,6 +5,8 @@ import torch
 from oran_scheduler.schedulers.allocation import (
     NO_ALLOCATION,
     CellAllocation,
+    apply_user_slot_actions,
+    build_empty_cell_allocation,
     build_next_user_slot_action_mask,
     validate_cell_allocation,
 )
@@ -70,6 +72,50 @@ class PPOLayerGreedySearchData:
     num_phy_evaluations:
         Number of candidate-set scoring calls performed.
     """
+
+    better_allocation_exists: torch.Tensor
+
+    chosen_pf_sum: torch.Tensor
+
+    best_pf_sum: torch.Tensor
+
+    num_phy_evaluations: int
+
+
+@dataclass(frozen=True)
+class PPOScheduleGreedySearchData:
+    """
+    Greedy PF comparison results for a complete
+    1LDS schedule.
+
+    allocation:
+        Reconstructed final CellAllocation produced
+        by replaying the actor actions layer by layer.
+
+    better_allocation_exists:
+        Shape [user_layer, RBG].
+
+        True means the greedy PF search found a
+        strictly better legal action for that specific
+        layer/RBG decision.
+
+    chosen_pf_sum:
+        Shape [user_layer, RBG].
+
+        PF sum resulting from the actor's actual action.
+
+    best_pf_sum:
+        Shape [user_layer, RBG].
+
+        Best PF sum found among the actor's action and
+        all legal alternatives.
+
+    num_phy_evaluations:
+        Total number of hypothetical candidate sets
+        scored across all layers and RBGs.
+    """
+
+    allocation: CellAllocation
 
     better_allocation_exists: torch.Tensor
 
@@ -525,5 +571,209 @@ def evaluate_ppo_layer_greedy_search(
             num_phy_evaluations
         ),
     )
+
+
+def evaluate_ppo_schedule_greedy_search(
+    *,
+    actions: torch.Tensor,
+    num_candidates: int,
+    past_average_throughput: torch.Tensor,
+    candidate_valid_mask: torch.Tensor,
+    score_rbg: RBGScoreFunction,
+    config: PPOGreedySearchConfig,
+) -> PPOScheduleGreedySearchData:
+    """
+    Replay a complete 1LDS action sequence and compute
+    the PPO greedy-search result for every layer/RBG.
+
+    Args:
+        actions:
+            Shape [user_layer, RBG].
+
+            Actor convention:
+
+                0 ... K-1
+                    candidate index
+
+                K
+                    NO ALLOCATION
+
+        num_candidates:
+            Maximum candidate count K.
+
+        past_average_throughput:
+            Shape [candidate].
+
+        candidate_valid_mask:
+            Shape [candidate].
+
+        score_rbg:
+            Callback that physically scores an arbitrary
+            scheduled candidate set on one RBG.
+
+    Returns:
+        Complete greedy-search information with shape
+
+            [user_layer, RBG]
+
+        for the per-decision quantities.
+    """
+
+    if actions.ndim != 2:
+        raise ValueError(
+            "actions must have shape "
+            "[user_layer, RBG]."
+        )
+
+    if actions.shape[0] < 1:
+        raise ValueError(
+            "At least one user layer is required."
+        )
+
+    if actions.shape[1] < 1:
+        raise ValueError(
+            "At least one RBG is required."
+        )
+
+    if torch.is_floating_point(
+        actions
+    ):
+        raise ValueError(
+            "actions must use an integer dtype."
+        )
+
+    num_user_slots = int(
+        actions.shape[0]
+    )
+
+    num_rbgs = int(
+        actions.shape[1]
+    )
+
+    device = actions.device
+
+    dtype = (
+        past_average_throughput.dtype
+    )
+
+    allocation = build_empty_cell_allocation(
+        num_user_slots=num_user_slots,
+        num_rbgs=num_rbgs,
+        device=device,
+    )
+
+    better_allocation_exists = torch.zeros(
+        (
+            num_user_slots,
+            num_rbgs,
+        ),
+        dtype=torch.bool,
+        device=device,
+    )
+
+    chosen_pf_sum = torch.zeros(
+        (
+            num_user_slots,
+            num_rbgs,
+        ),
+        dtype=dtype,
+        device=device,
+    )
+
+    best_pf_sum = torch.zeros(
+        (
+            num_user_slots,
+            num_rbgs,
+        ),
+        dtype=dtype,
+        device=device,
+    )
+
+    num_phy_evaluations = 0
+
+    for user_slot_index in range(
+        num_user_slots
+    ):
+        chosen_actions = actions[
+            user_slot_index,
+            :,
+        ]
+
+        layer_result = (
+            evaluate_ppo_layer_greedy_search(
+                allocation=allocation,
+                user_slot_index=(
+                    user_slot_index
+                ),
+                chosen_actions=chosen_actions,
+                num_candidates=num_candidates,
+                past_average_throughput=(
+                    past_average_throughput
+                ),
+                candidate_valid_mask=(
+                    candidate_valid_mask
+                ),
+                score_rbg=score_rbg,
+                config=config,
+            )
+        )
+
+
+        better_allocation_exists[
+            user_slot_index,
+            :,
+        ] = (
+            layer_result
+            .better_allocation_exists
+        )
+
+        chosen_pf_sum[
+            user_slot_index,
+            :,
+        ] = (
+            layer_result
+            .chosen_pf_sum
+        )
+
+        best_pf_sum[
+            user_slot_index,
+            :,
+        ] = (
+            layer_result
+            .best_pf_sum
+        )
+
+        num_phy_evaluations += (
+            layer_result
+            .num_phy_evaluations
+        )
+
+
+        allocation = apply_user_slot_actions(
+            allocation=allocation,
+            user_slot_index=(
+                user_slot_index
+            ),
+            actions=chosen_actions,
+            num_candidates=num_candidates,
+            candidate_valid_mask=(
+                candidate_valid_mask
+            ),
+        )
+
+
+
+    return PPOScheduleGreedySearchData(
+        allocation=allocation,
+        better_allocation_exists=(
+            better_allocation_exists
+        ),
+        chosen_pf_sum=chosen_pf_sum,
+        best_pf_sum=best_pf_sum,
+        num_phy_evaluations=(
+            num_phy_evaluations
+        ),
+    )
+
 
 
