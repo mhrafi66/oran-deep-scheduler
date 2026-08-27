@@ -107,6 +107,11 @@ from oran_scheduler.rl.ppo_reward import (
     build_greedy_indicator,
 )
 
+from oran_scheduler.rl.ppo_actor import (
+    OneLDSPPOActor,
+    OneLDSPPOActorConfig,
+)
+
 def print_first_candidate_features(
     feature_segment: torch.Tensor,
     num_rbgs: int,
@@ -201,6 +206,17 @@ def print_first_candidate_features(
 
 def main() -> None:
     device = "cuda:0"
+
+    # REPRODUCTION-SANITY seed only.
+    #
+    # The paper does not specify the exact neural-network
+    # initialization/random-action seed used in training.
+    #
+    # We set one here only so this untrained-actor sanity
+    # run is easier to reproduce.
+    torch.manual_seed(
+        1234
+    )
 
     num_candidates = 10
     num_rbgs = 18
@@ -1128,75 +1144,300 @@ def main() -> None:
         ),
     )
 
-    def controlled_policy(
+
+    # ------------------------------------------------------------------
+    # Untrained PAPER-SHAPED 1LDS PPO actor
+    # ------------------------------------------------------------------
+    #
+    # PAPER-SPECIFIED architecture:
+    #
+    #     410
+    #       ->
+    #      32
+    #       ->
+    #      32
+    #       ->
+    #     198
+    #
+    # 198 logits are reshaped to:
+    #
+    #     [18 RBG, 11 actions]
+    #
+    # IMPORTANT:
+    # The actor is completely UNTRAINED here.
+    # This run validates only the neural-policy interface.
+
+    actor_config = OneLDSPPOActorConfig(
+        state_size=state_config.state_size,
+        hidden_size=32,
+        num_rbgs=num_rbgs,
+        num_actions_per_rbg=(
+            num_candidates + 1
+        ),
+    )
+
+    actor = OneLDSPPOActor(
+        actor_config
+    ).to(
+        device
+    )
+
+    actor.eval()
+
+    actor_log_prob_by_layer = []
+
+    actor_entropy_by_layer = []
+
+    actor_masked_logits_by_layer = []
+
+    def neural_actor_policy(
         user_slot_index: int,
         decision,
     ) -> torch.Tensor:
         """
-        Deterministic integration-test policy.
+        Use the untrained 1LDS PPO actor to produce
+        one complete all-RBG scheduling decision.
 
-        This is NOT an RL policy.
+        This follows the training-style action path:
 
-        For every RBG:
+            state
+                ->
+            neural actor
+                ->
+            masked categorical distributions
+                ->
+            sampled action per RBG
 
-            1. Try candidate UEs in a rotating order.
-            2. Choose the first candidate allowed by
-               the current action mask.
-            3. If no real candidate is available,
-               choose NO ALLOCATION.
-
-        This intentionally exercises state evolution
-        and action masking across all UE slots.
+        No optimizer or learning occurs here.
         """
 
-        action_mask = decision.action_mask
-
-        actions = torch.full(
-            (
-                num_rbgs,
-            ),
-            fill_value=num_candidates,
-            dtype=torch.long,
-            device=device,
+        state_batch = (
+            decision
+            .state_data
+            .state
+            .unsqueeze(
+                0
+            )
         )
 
-        for rbg_index in range(
-            num_rbgs
-        ):
-            for offset in range(
-                num_candidates
-            ):
-                candidate_index = (
-                    rbg_index
-                    + user_slot_index
-                    + offset
-                ) % num_candidates
+        action_mask_batch = (
+            decision
+            .action_mask
+            .unsqueeze(
+                0
+            )
+        )
 
-                candidate_is_valid = bool(
-                    action_mask[
-                        rbg_index,
-                        candidate_index,
-                    ]
-                    .item()
+        with torch.no_grad():
+            action_data = (
+                actor.sample_actions(
+                    state=state_batch,
+                    action_mask=(
+                        action_mask_batch
+                    ),
                 )
+            )
 
-                if candidate_is_valid:
-                    actions[
-                        rbg_index
-                    ] = candidate_index
 
-                    break
+        actor_log_prob_by_layer.append(
+            action_data
+            .log_prob_by_rbg[
+                0
+            ]
+            .detach()
+            .clone()
+        )
+
+        actor_entropy_by_layer.append(
+            action_data
+            .entropy_by_rbg[
+                0
+            ]
+            .detach()
+            .clone()
+        )
+
+        actor_masked_logits_by_layer.append(
+            action_data
+            .masked_logits[
+                0
+            ]
+            .detach()
+            .clone()
+        )
+        actions = (
+            action_data
+            .actions[
+                0
+            ]
+        )
+
+        assert tuple(
+            actions.shape
+        ) == (
+            num_rbgs,
+        )
 
         return actions
+    
 
+    # def controlled_policy(
+    #     user_slot_index: int,
+    #     decision,
+    # ) -> torch.Tensor:
+    #     """
+    #     Deterministic integration-test policy.
+
+    #     This is NOT an RL policy.
+
+    #     For every RBG:
+
+    #         1. Try candidate UEs in a rotating order.
+    #         2. Choose the first candidate allowed by
+    #            the current action mask.
+    #         3. If no real candidate is available,
+    #            choose NO ALLOCATION.
+
+    #     This intentionally exercises state evolution
+    #     and action masking across all UE slots.
+    #     """
+
+    #     action_mask = decision.action_mask
+
+    #     actions = torch.full(
+    #         (
+    #             num_rbgs,
+    #         ),
+    #         fill_value=num_candidates,
+    #         dtype=torch.long,
+    #         device=device,
+    #     )
+
+    #     for rbg_index in range(
+    #         num_rbgs
+    #     ):
+    #         for offset in range(
+    #             num_candidates
+    #         ):
+    #             candidate_index = (
+    #                 rbg_index
+    #                 + user_slot_index
+    #                 + offset
+    #             ) % num_candidates
+
+    #             candidate_is_valid = bool(
+    #                 action_mask[
+    #                     rbg_index,
+    #                     candidate_index,
+    #                 ]
+    #                 .item()
+    #             )
+
+    #             if candidate_is_valid:
+    #                 actions[
+    #                     rbg_index
+    #                 ] = candidate_index
+
+    #                 break
+
+    #     return actions
+
+    # schedule_result = run_1lds_user_slot_loop(
+    #     num_user_slots=num_user_slots,
+    #     inputs=decision_inputs,
+    #     state_config=state_config,
+    #     action_policy=controlled_policy,
+    #     device=device,
+    # )
     schedule_result = run_1lds_user_slot_loop(
         num_user_slots=num_user_slots,
         inputs=decision_inputs,
         state_config=state_config,
-        action_policy=controlled_policy,
+        action_policy=(
+            neural_actor_policy
+        ),
         device=device,
     )
 
+    actor_log_prob = torch.stack(
+        actor_log_prob_by_layer,
+        dim=0,
+    )
+
+    actor_entropy = torch.stack(
+        actor_entropy_by_layer,
+        dim=0,
+    )
+
+    actor_masked_logits = torch.stack(
+        actor_masked_logits_by_layer,
+        dim=0,
+    )
+
+    assert tuple(
+        actor_log_prob.shape
+    ) == (
+        num_user_slots,
+        num_rbgs,
+    )
+
+    assert tuple(
+        actor_entropy.shape
+    ) == (
+        num_user_slots,
+        num_rbgs,
+    )
+
+    assert tuple(
+        actor_masked_logits.shape
+    ) == (
+        num_user_slots,
+        num_rbgs,
+        num_candidates + 1,
+    )
+
+    assert torch.isfinite(
+        actor_log_prob
+    ).all()
+
+    assert torch.isfinite(
+        actor_entropy
+    ).all()
+
+    for user_slot_index in range(
+        num_user_slots
+    ):
+        decision = (
+            schedule_result
+            .decisions[
+                user_slot_index
+            ]
+        )
+
+        actions = (
+            schedule_result
+            .actions[
+                user_slot_index
+            ]
+        )
+
+        rbg_indices = torch.arange(
+            num_rbgs,
+            dtype=torch.long,
+            device=device,
+        )
+
+        sampled_action_is_valid = (
+            decision
+            .action_mask[
+                rbg_indices,
+                actions,
+            ]
+        )
+
+        assert torch.all(
+            sampled_action_is_valid
+        )
 
     assert len(
         schedule_result.decisions
@@ -1218,6 +1459,85 @@ def main() -> None:
         num_user_slots,
         num_rbgs,
     )
+
+    print()
+    print("=" * 72)
+    print("Untrained PPO Actor Diagnostics")
+    print("=" * 72)
+
+    num_actor_parameters = sum(
+        parameter.numel()
+        for parameter
+        in actor.parameters()
+    )
+
+    print(
+        "Actor parameters:          "
+        f"{num_actor_parameters}"
+    )
+
+    print(
+        "Actor state size:          "
+        f"{actor_config.state_size}"
+    )
+
+    print(
+        "Actor output size:         "
+        f"{actor_config.output_size}"
+    )
+
+    print(
+        "Stored log-prob shape:     "
+        f"{tuple(actor_log_prob.shape)}"
+    )
+
+    print(
+        "Stored entropy shape:      "
+        f"{tuple(actor_entropy.shape)}"
+    )
+
+    for user_slot_index in range(
+        num_user_slots
+    ):
+        mean_log_prob = float(
+            actor_log_prob[
+                user_slot_index
+            ]
+            .mean()
+            .item()
+        )
+
+        mean_entropy = float(
+            actor_entropy[
+                user_slot_index
+            ]
+            .mean()
+            .item()
+        )
+
+        print()
+        print(
+            f"UE slot {user_slot_index}"
+        )
+
+        print(
+            "  mean selected log-prob: "
+            f"{mean_log_prob:.6f}"
+        )
+
+        print(
+            "  mean policy entropy:     "
+            f"{mean_entropy:.6f}"
+        )
+
+        print(
+            "  neural actions:"
+        )
+
+        print(
+            "    "
+            f"{schedule_result.actions[user_slot_index].detach().cpu().tolist()}"
+        )
 
     print()
     print("=" * 72)
@@ -2408,8 +2728,13 @@ def main() -> None:
     print("IMPORTANT:")
 
     print(
-        "- The controlled action callback is "
-        "still NOT an RL policy."
+        "- Scheduling actions now come from an "
+        "actual 1LDS PPO actor network."
+    )
+
+    print(
+        "- The actor is still completely UNTRAINED; "
+        "its current actions have no learned meaning."
     )
 
     print(
@@ -2468,8 +2793,13 @@ def main() -> None:
     )
 
     print(
-        "- The controlled callback is only an "
-        "integration-test policy, not RL."
+        "- The scheduler is now driven by an "
+        "untrained neural actor."
+    )
+
+    print(
+        "- PPO optimization has not yet been "
+        "implemented."
     )
 
     # allocation_0 = build_empty_cell_allocation(
