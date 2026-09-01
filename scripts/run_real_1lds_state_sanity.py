@@ -112,6 +112,11 @@ from oran_scheduler.rl.ppo_actor import (
     OneLDSPPOActorConfig,
 )
 
+from oran_scheduler.rl.ppo_critic import (
+    OneLDSPPOCritic,
+    OneLDSPPOCriticConfig,
+)
+
 def print_first_candidate_features(
     feature_segment: torch.Tensor,
     num_rbgs: int,
@@ -1190,6 +1195,19 @@ def main() -> None:
 
     actor_masked_logits_by_layer = []
 
+    critic = OneLDSPPOCritic(
+        OneLDSPPOCriticConfig(
+            state_size=state_config.state_size,
+            hidden_size=32,
+        )
+    ).to(
+        device
+    )
+
+    critic.eval()
+
+
+
     def neural_actor_policy(
         user_slot_index: int,
         decision,
@@ -1460,6 +1478,34 @@ def main() -> None:
         num_rbgs,
     )
 
+
+    critic_state_batch = torch.stack(
+        [
+            decision
+            .state_data
+            .state
+
+            for decision
+            in schedule_result.decisions
+        ],
+        dim=0,
+    )
+
+    with torch.no_grad():
+        critic_value_by_layer = critic(
+            critic_state_batch
+        )
+
+    assert tuple(
+        critic_value_by_layer.shape
+    ) == (
+        num_user_slots,
+    )
+
+    assert torch.isfinite(
+        critic_value_by_layer
+    ).all()
+
     print()
     print("=" * 72)
     print("Untrained PPO Actor Diagnostics")
@@ -1539,6 +1585,17 @@ def main() -> None:
             f"{schedule_result.actions[user_slot_index].detach().cpu().tolist()}"
         )
 
+
+    print(
+        "Critic state batch shape: "
+        f"{tuple(critic_state_batch.shape)}"
+    )
+
+    print(
+        "Critic value shape:       "
+        f"{tuple(critic_value_by_layer.shape)}"
+    )
+
     print()
     print("=" * 72)
     print("Complete 1LDS UE-Slot Loop")
@@ -1578,7 +1635,17 @@ def main() -> None:
             .max()
             .item()
         )
+        critic_value = float(
+            critic_value_by_layer[
+                user_slot_index
+            ]
+            .item()
+        )
 
+        print(
+            "  critic V(s):            "
+            f"{critic_value:.6f}"
+        )
         print()
         print(
             f"UE slot {user_slot_index}"
@@ -1630,6 +1697,19 @@ def main() -> None:
         .cpu()
         .tolist()
     )
+
+
+        # critic_value = float(
+        #     critic_value_by_layer[
+        #         user_slot_index
+        #     ]
+        #     .item()
+        # )
+
+        # print(
+        #     "  critic V(s):            "
+        #     f"{critic_value:.6f}"
+        # )
 
     print()
     print("=" * 72)

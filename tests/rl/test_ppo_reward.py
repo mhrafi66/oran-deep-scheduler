@@ -7,6 +7,10 @@ from oran_scheduler.rl.ppo_reward import (
     compute_ppo_reward,
 )
 
+from oran_scheduler.rl.ppo_reward import (
+    reduce_ppo_rbg_rewards,
+)
+
 
 def test_geometric_mean_throughput():
     throughput = torch.tensor(
@@ -341,5 +345,106 @@ def test_reward_rejects_negative_throughput():
     raise AssertionError(
         "Negative throughput should raise ValueError."
     )
+
+
+
+def test_reduce_ppo_rbg_rewards_with_mean():
+    reward_by_rbg = torch.tensor(
+        [
+            [
+                0.2,
+                0.2,
+                -0.2,
+                0.2,
+            ],
+            [
+                -0.2,
+                -0.2,
+                0.2,
+                0.2,
+            ],
+        ],
+        dtype=torch.float32,
+    )
+
+    reward_by_layer = (
+        reduce_ppo_rbg_rewards(
+            reward_by_rbg,
+            reduction="mean",
+        )
+    )
+
+    expected = torch.tensor(
+        [
+            0.1,
+            0.0,
+        ],
+        dtype=torch.float32,
+    )
+
+    torch.testing.assert_close(
+        reward_by_layer,
+        expected,
+    )
+
+def test_reduce_ppo_rbg_rewards_with_sum():
+    reward_by_rbg = torch.tensor(
+        [
+            [
+                0.2,
+                0.2,
+                -0.2,
+                0.2,
+            ]
+        ],
+        dtype=torch.float32,
+    )
+
+    reward_by_layer = (
+        reduce_ppo_rbg_rewards(
+            reward_by_rbg,
+            reduction="sum",
+        )
+    )
+
+    expected = torch.tensor(
+        [
+            0.4,
+        ],
+        dtype=torch.float32,
+    )
+
+    torch.testing.assert_close(
+        reward_by_layer,
+        expected,
+    )
+
+def test_reduce_ppo_rbg_rewards_rejects_unknown_reduction():
+    reward_by_rbg = torch.zeros(
+        (
+            2,
+            18,
+        ),
+        dtype=torch.float32,
+    )
+
+    try:
+        reduce_ppo_rbg_rewards(
+            reward_by_rbg,
+            reduction="median",
+        )
+
+    except ValueError:
+        return
+
+    raise AssertionError(
+        "Unknown PPO reward reduction must "
+        "raise ValueError."
+    )
+
+
+
+
+
 
 
