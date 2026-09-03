@@ -1,6 +1,14 @@
 from dataclasses import dataclass
 
+from typing import Literal
+
 import torch
+
+
+PPORewardReduction = Literal[
+    "mean",
+    "sum",
+]
 
 
 @dataclass(frozen=True)
@@ -358,5 +366,90 @@ def compute_ppo_reward(
             reward_by_layer_rbg
         ),
     )
+
+
+
+
+
+def reduce_ppo_rbg_rewards(
+    reward_by_rbg: torch.Tensor,
+    *,
+    reduction: PPORewardReduction = "mean",
+) -> torch.Tensor:
+    """
+    Reduce RBG-local PPO rewards to one joint reward.
+
+    Input shape:
+
+        [..., RBG]
+
+    Output shape:
+
+        [...]
+
+    Example for 1LDS:
+
+        input:
+            [layer, RBG]
+
+        output:
+            [layer]
+
+    PAPER-SPECIFIED:
+        The v3 reward is defined locally as r_{m,l}.
+
+    PAPER-INFERRED / OPEN-REPRODUCTION:
+        The public paper does not explicitly specify how
+        the RBG-local rewards are converted to the scalar
+        reward used by the joint PPO value/GAE formulation.
+
+        The primary reproduction uses the arithmetic mean.
+
+    The unreduced reward tensor should still be preserved
+    by the rollout code for analysis and sensitivity tests.
+    """
+
+    if reward_by_rbg.ndim < 1:
+        raise ValueError(
+            "reward_by_rbg must have at least "
+            "one dimension."
+        )
+
+    if reward_by_rbg.shape[-1] < 1:
+        raise ValueError(
+            "The RBG dimension must be non-empty."
+        )
+
+    if not torch.is_floating_point(
+        reward_by_rbg
+    ):
+        raise ValueError(
+            "reward_by_rbg must use a "
+            "floating-point dtype."
+        )
+
+    if not torch.isfinite(
+        reward_by_rbg
+    ).all():
+        raise ValueError(
+            "reward_by_rbg contains non-finite "
+            "values."
+        )
+
+    if reduction == "mean":
+        return reward_by_rbg.mean(
+            dim=-1
+        )
+
+    if reduction == "sum":
+        return reward_by_rbg.sum(
+            dim=-1
+        )
+
+    raise ValueError(
+        "Unsupported PPO reward reduction: "
+        f"{reduction!r}."
+    )
+
 
 

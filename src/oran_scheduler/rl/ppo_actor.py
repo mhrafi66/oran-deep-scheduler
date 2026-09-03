@@ -456,4 +456,61 @@ class OneLDSPPOActor(nn.Module):
         )
 
     
+def compute_joint_action_log_prob(
+    log_prob_by_rbg: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Convert factorized RBG log probabilities to the
+    log probability of the complete joint action.
 
+    If:
+
+        pi(a | s)
+            =
+        product_m pi_m(a_m | s)
+
+    then:
+
+        log pi(a | s)
+            =
+        sum_m log pi_m(a_m | s)
+
+    Input shape:
+
+        [..., RBG]
+
+    Output shape:
+
+        [...]
+    """
+
+    if log_prob_by_rbg.ndim < 1:
+        raise ValueError(
+            "log_prob_by_rbg must have at least "
+            "one dimension."
+        )
+
+    if log_prob_by_rbg.shape[-1] < 1:
+        raise ValueError(
+            "The RBG dimension must be non-empty."
+        )
+
+    if not torch.is_floating_point(
+        log_prob_by_rbg
+    ):
+        raise ValueError(
+            "log_prob_by_rbg must use a "
+            "floating-point dtype."
+        )
+
+    if not torch.isfinite(
+        log_prob_by_rbg
+    ).all():
+        raise ValueError(
+            "log_prob_by_rbg contains non-finite "
+            "values."
+        )
+
+    return log_prob_by_rbg.sum(
+        dim=-1
+    )

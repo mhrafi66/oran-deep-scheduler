@@ -6,6 +6,12 @@ from oran_scheduler.rl.ppo_actor import (
     OneLDSPPOActorConfig,
 )
 
+from oran_scheduler.rl.ppo_actor import (
+    OneLDSPPOActor,
+    OneLDSPPOActorConfig,
+    compute_joint_action_log_prob,
+)
+
 
 def test_actor_architecture_and_output_shape():
     config = OneLDSPPOActorConfig()
@@ -419,5 +425,45 @@ def test_actor_rejects_rbg_with_no_valid_action():
         "An RBG with no valid action must "
         "raise ValueError."
     )
+
+
+
+def test_joint_action_log_prob_sums_rbg_log_probs():
+    log_prob_by_rbg = torch.tensor(
+        [
+            [
+                -0.5,
+                -1.0,
+                -0.25,
+            ],
+            [
+                -0.2,
+                -0.3,
+                -0.4,
+            ],
+        ],
+        dtype=torch.float32,
+    )
+
+    joint_log_prob = (
+        compute_joint_action_log_prob(
+            log_prob_by_rbg
+        )
+    )
+
+    expected = torch.tensor(
+        [
+            -1.75,
+            -0.9,
+        ],
+        dtype=torch.float32,
+    )
+
+    torch.testing.assert_close(
+        joint_log_prob,
+        expected,
+    )
+
+
 
 
