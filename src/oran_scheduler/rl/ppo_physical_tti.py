@@ -61,6 +61,10 @@ class PPOPhysicalTTIOutcome:
         Counterfactual PF comparison for every
         [user_layer, RBG] actor decision.
 
+        None only when counterfactual evaluation is
+        deliberately skipped during pre-collection
+        warm-up.
+
     num_score_requests:
         Number of score requests issued by the
         counterfactual greedy judge.
@@ -81,6 +85,7 @@ class PPOPhysicalTTIOutcome:
 
     greedy_search: (
         PPOScheduleGreedySearchData
+        | None
     )
 
     num_score_requests: int
@@ -357,6 +362,86 @@ def _validate_physical_tti_inputs(
             "to distinct global UEs."
         )
 
+    candidate_physical_ue_indices = (
+        physical_inputs
+        .candidate_physical_ue_indices
+    )
+
+    if (
+        candidate_physical_ue_indices
+        is not None
+    ):
+        if tuple(
+            candidate_physical_ue_indices
+            .shape
+        ) != tuple(
+            candidate_global_ue_indices
+            .shape
+        ):
+            raise ValueError(
+                "Physical candidate UE mapping must "
+                "have shape [candidate]."
+            )
+
+        if (
+            candidate_physical_ue_indices
+            .device
+            != scheduler_device
+        ):
+            raise ValueError(
+                "Physical candidate UE mapping is "
+                "on the wrong device."
+            )
+
+        valid_physical_ue_indices = (
+            candidate_physical_ue_indices[
+                candidate_valid_mask
+            ]
+        )
+
+        if (
+            valid_physical_ue_indices
+            .numel()
+            > 0
+            and torch.any(
+                valid_physical_ue_indices
+                < 0
+            )
+        ):
+            raise ValueError(
+                "A valid candidate cannot have a "
+                "negative physical UE index."
+            )
+
+        if (
+            valid_physical_ue_indices
+            .numel()
+            > 0
+            and torch.any(
+                valid_physical_ue_indices
+                >= physical_inputs
+                .h_freq
+                .shape[1]
+            )
+        ):
+            raise ValueError(
+                "A valid candidate physical UE "
+                "index exceeds the stored PHY "
+                "tensor."
+            )
+
+        if (
+            torch.unique(
+                valid_physical_ue_indices
+            ).numel()
+            != valid_physical_ue_indices
+            .numel()
+        ):
+            raise ValueError(
+                "Valid candidates must map to "
+                "distinct physical UE entries."
+            )
+
     selected_actor_actions = (
         actions[
             actions
@@ -393,6 +478,11 @@ def evaluate_ppo_physical_tti(
     candidate_valid_mask: torch.Tensor,
     physical_inputs: PPOPhysicalScoreInputs,
     greedy_config: PPOGreedySearchConfig,
+    physical_scorer: (
+        CachedPPOPhysicalRBGScorer
+        | None
+    ) = None,
+    run_counterfactual_greedy: bool = True,
 ) -> PPOPhysicalTTIOutcome:
     """
     Evaluate the physical outcome of one complete PPO
@@ -446,6 +536,11 @@ def evaluate_ppo_physical_tti(
             candidate_global_ue_indices=(
                 physical_inputs
                 .candidate_global_ue_indices
+            ),
+
+            candidate_physical_ue_indices=(
+                physical_inputs
+                .candidate_physical_ue_indices
             ),
             h_freq=physical_inputs.h_freq,
             serving_cell_index=(
@@ -509,16 +604,79 @@ def evaluate_ppo_physical_tti(
             "unexpected candidate-rate shape."
         )
 
+
+    # ----------------------------------------------------------
+    # WARM-UP FAST PATH
     #
-    # Training-only counterfactual judge.
+    # PAPER-SPECIFIED:
+    #     PPO experience collection starts only
+    #     after the initial 100 TTIs.
     #
-    # It evaluates hypothetical allocations using
-    # exactly the same common PHY.
+    # During those TTIs the actual actor schedule
+    # must still pass through the real PHY because
+    # traffic delivery and PF history must evolve.
     #
-    physical_scorer = (
-        CachedPPOPhysicalRBGScorer(
-            physical_inputs
+    # But the counterfactual greedy reward judge is
+    # training-only work and produces no usable PPO
+    # sample during warm-up.
+    # ----------------------------------------------------------
+
+    if not run_counterfactual_greedy:
+        if physical_scorer is not None:
+            raise ValueError(
+                "physical_scorer must be None when "
+                "counterfactual greedy evaluation "
+                "is disabled."
+            )
+
+        return PPOPhysicalTTIOutcome(
+            allocation_evaluation=(
+                allocation_evaluation
+            ),
+            candidate_total_target_compliant_rate_bps=(
+                candidate_total_rate
+                .detach()
+                .clone()
+            ),
+            greedy_search=None,
+            num_score_requests=0,
+            num_unique_phy_evaluations=0,
         )
+
+    # ----------------------------------------------------------
+    # COUNTERFACTUAL TRAINING JUDGE
+    #
+    # A caller may provide a scorer already used by
+    # Teacher 2. Reusing it preserves the exact same
+    # PHY calculations while avoiding duplicate
+    # candidate-set evaluations.
+    # ----------------------------------------------------------
+
+    if physical_scorer is None:
+        physical_scorer = (
+            CachedPPOPhysicalRBGScorer(
+                physical_inputs
+            )
+        )
+
+    elif (
+        physical_scorer.inputs
+        is not physical_inputs
+    ):
+        raise ValueError(
+            "A shared PPO physical scorer must have "
+            "been constructed from the exact same "
+            "physical_inputs object."
+        )
+
+    score_requests_before = (
+        physical_scorer
+        .num_score_requests
+    )
+
+    unique_evaluations_before = (
+        physical_scorer
+        .num_unique_phy_evaluations
     )
 
     greedy_search = (
@@ -553,6 +711,16 @@ def evaluate_ppo_physical_tti(
             "reconstruct the actor allocation."
         )
 
+    score_requests_after = (
+        physical_scorer
+        .num_score_requests
+    )
+
+    unique_evaluations_after = (
+        physical_scorer
+        .num_unique_phy_evaluations
+    )
+
     return PPOPhysicalTTIOutcome(
         allocation_evaluation=(
             allocation_evaluation
@@ -564,12 +732,12 @@ def evaluate_ppo_physical_tti(
         ),
         greedy_search=greedy_search,
         num_score_requests=(
-            physical_scorer
-            .num_score_requests
+            score_requests_after
+            - score_requests_before
         ),
         num_unique_phy_evaluations=(
-            physical_scorer
-            .num_unique_phy_evaluations
+            unique_evaluations_after
+            - unique_evaluations_before
         ),
     )
 
@@ -625,9 +793,19 @@ def resolve_ppo_tti_reward(
             "reward_population_name cannot be empty."
         )
 
-    reward_reference_device = (
+    greedy_search = (
         physical_outcome
         .greedy_search
+    )
+
+    if greedy_search is None:
+        raise ValueError(
+            "PPO reward cannot be resolved without "
+            "the counterfactual greedy search."
+        )
+
+    reward_reference_device = (
+        greedy_search
         .better_allocation_exists
         .device
     )
@@ -658,8 +836,7 @@ def resolve_ppo_tti_reward(
             reward_valid_ue_mask
         ),
         better_allocation_exists=(
-            physical_outcome
-            .greedy_search
+            greedy_search
             .better_allocation_exists
         ),
         config=reward_config,

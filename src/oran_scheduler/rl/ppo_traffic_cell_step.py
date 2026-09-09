@@ -133,8 +133,13 @@ class TrafficAwarePPOCellTTIStepResult:
         PF-TDS candidate order.
 
     reward:
-        PPO reward calculated using ACTUAL delivered
-        throughput rather than raw PHY capacity.
+        PPO reward calculated using actual delivered
+        throughput.
+
+        None during pre-collection warm-up because
+        no PPO transition is being collected and the
+        training-only counterfactual reward search is
+        intentionally skipped.
 
     history_update:
         Next-TTI PF throughput history.
@@ -164,7 +169,10 @@ class TrafficAwarePPOCellTTIStepResult:
         torch.Tensor
     )
 
-    reward: PPOResolvedTTIReward
+    reward: (
+        PPOResolvedTTIReward
+        | None
+    )
 
     expert_labels: (
         PPOPFExpertTTILabels | None
@@ -1001,7 +1009,31 @@ def run_traffic_aware_ppo_cell_tti_step(
             "mask."
         )
 
+    # ----------------------------------------------------------
+    # SHARED COUNTERFACTUAL PHY CACHE
+    #
+    # During normal PPO collection both Teacher 2
+    # and the PPO greedy reward judge examine many
+    # overlapping RBG/candidate-set combinations.
+    #
+    # They must use the same physical model, so they
+    # can safely share one exact-result cache.
+    #
+    # During warm-up neither counterfactual search is
+    # needed.
+    # ----------------------------------------------------------
 
+    shared_physical_scorer: (
+        CachedPPOPhysicalRBGScorer
+        | None
+    ) = None
+
+    if collect_experience:
+        shared_physical_scorer = (
+            CachedPPOPhysicalRBGScorer(
+                physical_inputs
+            )
+        )
     # ----------------------------------------------------------
     # Teacher 2: PF expert supervision.
     #
@@ -1031,10 +1063,15 @@ def run_traffic_aware_ppo_cell_tti_step(
             pf_expert_config is not None
         )
 
-        expert_physical_scorer = (
-            CachedPPOPhysicalRBGScorer(
-                physical_inputs
-            )
+        # expert_physical_scorer = (
+        #     CachedPPOPhysicalRBGScorer(
+        #         physical_inputs
+        #     )
+        # )
+
+        assert (
+            shared_physical_scorer
+            is not None
         )
 
         expert_labels = (
@@ -1054,7 +1091,7 @@ def run_traffic_aware_ppo_cell_tti_step(
                     .candidate_valid_mask
                 ),
                 score_rbg=(
-                    expert_physical_scorer
+                    shared_physical_scorer
                 ),
                 config=(
                     pf_expert_config
@@ -1086,6 +1123,12 @@ def run_traffic_aware_ppo_cell_tti_step(
             ),
             greedy_config=(
                 greedy_config
+            ),
+            physical_scorer=(
+                shared_physical_scorer
+            ),
+            run_counterfactual_greedy=(
+                collect_experience
             ),
         )
     )
@@ -1143,60 +1186,138 @@ def run_traffic_aware_ppo_cell_tti_step(
         )
     )
 
+    # # ----------------------------------------------------------
+    # # 7. PPO reward uses ACTUAL delivered throughput.
+    # # ----------------------------------------------------------
+
+    # reward = _resolve_traffic_reward(
+    #     physical_outcome=(
+    #         physical_outcome
+    #     ),
+    #     candidate_delivered_rate_bps=(
+    #         candidate_delivered_rate_bps
+    #     ),
+    #     candidate_valid_mask=(
+    #         prepared.candidate_valid_mask
+    #     ),
+    #     serving_delivered_rate_bps=(
+    #         traffic_service
+    #         .delivered_rate_bps
+    #     ),
+    #     serving_valid_mask=(
+    #         scheduler_observation
+    #         .serving_ue_valid_mask
+    #     ),
+    #     reward_population=(
+    #         reward_population
+    #     ),
+    #     reward_config=reward_config,
+    #     reward_reduction=(
+    #         reward_reduction
+    #     ),
+    # )
+
+    # expected_reward_shape = (
+    #     training_controller
+    #     .config
+    #     .num_user_slots,
+    #     state_config.num_rbgs,
+    # )
+
+    # if tuple(
+    #     reward
+    #     .reward_data
+    #     .reward_by_layer_rbg
+    #     .shape
+    # ) != expected_reward_shape:
+    #     raise RuntimeError(
+    #         "Traffic-aware PPO reward has the "
+    #         "wrong [user_slot, RBG] shape."
+    #     )
+
+    # # ----------------------------------------------------------
+    # # 8. Attach delayed reward to PPO trajectory.
+    # # ----------------------------------------------------------
+
+    # if collect_experience:
+    #     training_controller.finish_tti(
+    #         reward_by_rbg=(
+    #             reward
+    #             .reward_data
+    #             .reward_by_layer_rbg
+    #         ),
+    #         reduced_reward=(
+    #             reward.reduced_reward
+    #         ),
+    #     )
+
     # ----------------------------------------------------------
-    # 7. PPO reward uses ACTUAL delivered throughput.
+    # 7. PPO reward.
+    #
+    # During collection:
+    #     calculate the paper reward and attach it
+    #     to the on-policy trajectory.
+    #
+    # During the first 100 warm-up TTIs:
+    #     no PPO transition exists, so no
+    #     counterfactual reward is required.
+    #
+    # Traffic service and PF-history evolution still
+    # happen normally below.
     # ----------------------------------------------------------
 
-    reward = _resolve_traffic_reward(
-        physical_outcome=(
-            physical_outcome
-        ),
-        candidate_delivered_rate_bps=(
-            candidate_delivered_rate_bps
-        ),
-        candidate_valid_mask=(
-            prepared.candidate_valid_mask
-        ),
-        serving_delivered_rate_bps=(
-            traffic_service
-            .delivered_rate_bps
-        ),
-        serving_valid_mask=(
-            scheduler_observation
-            .serving_ue_valid_mask
-        ),
-        reward_population=(
-            reward_population
-        ),
-        reward_config=reward_config,
-        reward_reduction=(
-            reward_reduction
-        ),
-    )
-
-    expected_reward_shape = (
-        training_controller
-        .config
-        .num_user_slots,
-        state_config.num_rbgs,
-    )
-
-    if tuple(
-        reward
-        .reward_data
-        .reward_by_layer_rbg
-        .shape
-    ) != expected_reward_shape:
-        raise RuntimeError(
-            "Traffic-aware PPO reward has the "
-            "wrong [user_slot, RBG] shape."
-        )
-
-    # ----------------------------------------------------------
-    # 8. Attach delayed reward to PPO trajectory.
-    # ----------------------------------------------------------
+    reward: (
+        PPOResolvedTTIReward
+        | None
+    ) = None
 
     if collect_experience:
+        reward = _resolve_traffic_reward(
+            physical_outcome=(
+                physical_outcome
+            ),
+            candidate_delivered_rate_bps=(
+                candidate_delivered_rate_bps
+            ),
+            candidate_valid_mask=(
+                prepared
+                .candidate_valid_mask
+            ),
+            serving_delivered_rate_bps=(
+                traffic_service
+                .delivered_rate_bps
+            ),
+            serving_valid_mask=(
+                scheduler_observation
+                .serving_ue_valid_mask
+            ),
+            reward_population=(
+                reward_population
+            ),
+            reward_config=reward_config,
+            reward_reduction=(
+                reward_reduction
+            ),
+        )
+
+        expected_reward_shape = (
+            training_controller
+            .config
+            .num_user_slots,
+            state_config.num_rbgs,
+        )
+
+        if tuple(
+            reward
+            .reward_data
+            .reward_by_layer_rbg
+            .shape
+        ) != expected_reward_shape:
+            raise RuntimeError(
+                "Traffic-aware PPO reward has the "
+                "wrong [user_slot, RBG] shape."
+            )
+
         training_controller.finish_tti(
             reward_by_rbg=(
                 reward

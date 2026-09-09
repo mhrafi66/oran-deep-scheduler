@@ -8,6 +8,7 @@ from oran_scheduler.phy.rate import (
 )
 from oran_scheduler.phy.schedule_evaluator import (
     evaluate_cell_allocation,
+    evaluate_rbg_candidate_set,
 )
 from oran_scheduler.schedulers.allocation import (
     CellAllocation,
@@ -310,4 +311,182 @@ def test_empty_rbg_has_zero_rate():
         ].item()
     ) == 0
 
-    
+
+
+def test_phy_can_separate_global_identity_from_local_storage():
+    device = "cuda:0"
+
+    #
+    # Only TWO UE channels are physically stored.
+    #
+    # Their simulator-global identities, however,
+    # are deliberately far outside [0, 1].
+    #
+    h_freq = torch.zeros(
+        (
+            1,   # batch
+            2,   # locally stored PHY UEs
+            1,   # RX antenna
+            1,   # BS
+            2,   # TX antennas
+            1,   # OFDM symbol
+            12,  # one RBG
+        ),
+        dtype=torch.complex64,
+        device=device,
+    )
+
+    #
+    # Local PHY UE 0.
+    #
+    h_freq[
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        :,
+    ] = 1.0
+
+    #
+    # Local PHY UE 1.
+    #
+    h_freq[
+        0,
+        1,
+        0,
+        0,
+        1,
+        0,
+        :,
+    ] = 1.0
+
+    #
+    # Persistent scheduler/simulator identities.
+    #
+    candidate_global_ue_indices = (
+        torch.tensor(
+            [
+                103,
+                317,
+            ],
+            dtype=torch.long,
+            device=device,
+        )
+    )
+
+    #
+    # Where those UEs are stored in THIS local
+    # physical tensor.
+    #
+    candidate_physical_ue_indices = (
+        torch.tensor(
+            [
+                0,
+                1,
+            ],
+            dtype=torch.long,
+            device=device,
+        )
+    )
+
+    recommended_rank = torch.ones(
+        (
+            1,
+            2,
+        ),
+        dtype=torch.long,
+        device=device,
+    )
+
+    rx_combiners = torch.ones(
+        (
+            1,
+            2,
+            1,
+            2,
+            1,
+        ),
+        dtype=torch.complex64,
+        device=device,
+    )
+
+    result = evaluate_rbg_candidate_set(
+        selected_candidate_indices=(
+            torch.tensor(
+                [
+                    0,
+                    1,
+                ],
+                dtype=torch.long,
+                device=device,
+            )
+        ),
+        candidate_global_ue_indices=(
+            candidate_global_ue_indices
+        ),
+        candidate_physical_ue_indices=(
+            candidate_physical_ue_indices
+        ),
+        h_freq=h_freq,
+        serving_cell_index=0,
+        recommended_rank=(
+            recommended_rank
+        ),
+        rx_combiners=(
+            rx_combiners
+        ),
+        rbg_index=0,
+        csi_subcarrier_index=6,
+        subcarriers_per_rbg=12,
+        tx_power_per_subcarrier_w=2.0,
+        noise_power_per_subcarrier_w=1.0e-3,
+        link_adaptation_config=(
+            LinkAdaptationConfig(
+                num_rbgs=1,
+                subcarriers_per_rbg=12,
+                device=device,
+            )
+        ),
+        rate_config=(
+            RateConfig(
+                subcarriers_per_rbg=12,
+                device=device,
+            )
+        ),
+    )
+
+    #
+    # The PHY used local tensor positions 0 and 1...
+    #
+    assert h_freq.shape[1] == 2
+
+    #
+    # ...but it must NEVER lose the real identities.
+    #
+    torch.testing.assert_close(
+        result.selected_global_ue_indices,
+        torch.tensor(
+            [
+                103,
+                317,
+            ],
+            dtype=torch.long,
+            device=device,
+        ),
+    )
+
+    assert tuple(
+        result.target_compliant_rate_bps.shape
+    ) == (
+        2,
+    )
+
+    assert torch.isfinite(
+        result.target_compliant_rate_bps
+    ).all()
+
+    assert torch.isfinite(
+        result.total_target_compliant_rate_bps
+    )

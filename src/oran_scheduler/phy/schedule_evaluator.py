@@ -123,6 +123,163 @@ class RBGAllocationEvaluationData:
 
     rzf_alpha: float
 
+
+def _resolve_candidate_physical_ue_indices(
+    *,
+    candidate_global_ue_indices: torch.Tensor,
+    candidate_physical_ue_indices: (
+        torch.Tensor | None
+    ),
+    h_freq: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Resolve scheduler-global UE identities to the
+    UE indices used by the currently stored PHY tensor.
+
+    Normal/full-channel mode:
+        candidate_physical_ue_indices is None
+
+        global UE ID == h_freq UE-axis index
+
+    Memory-safe/chunked mode:
+        candidate_global_ue_indices
+            preserve persistent simulator identity
+
+        candidate_physical_ue_indices
+            identify where those same UEs live in the
+            local/chunked PHY tensors
+
+    Example:
+
+        global identities:
+            [103, 151, 209]
+
+        local PHY indices:
+            [0, 1, 2]
+
+    This mapping is an OPEN-REPRODUCTION ENGINEERING
+    mechanism. It does not alter scheduler semantics.
+    """
+
+    if candidate_global_ue_indices.ndim != 1:
+        raise ValueError(
+            "candidate_global_ue_indices must have "
+            "shape [candidate]."
+        )
+
+    if candidate_physical_ue_indices is None:
+        resolved = (
+            candidate_global_ue_indices
+        )
+
+    else:
+        if (
+            candidate_physical_ue_indices.ndim
+            != 1
+        ):
+            raise ValueError(
+                "candidate_physical_ue_indices must "
+                "have shape [candidate]."
+            )
+
+        if tuple(
+            candidate_physical_ue_indices.shape
+        ) != tuple(
+            candidate_global_ue_indices.shape
+        ):
+            raise ValueError(
+                "Global and physical candidate UE "
+                "indices must have the same shape."
+            )
+
+        if torch.is_floating_point(
+            candidate_physical_ue_indices
+        ):
+            raise ValueError(
+                "candidate_physical_ue_indices must "
+                "use an integer dtype."
+            )
+
+        if (
+            candidate_physical_ue_indices.dtype
+            == torch.bool
+        ):
+            raise ValueError(
+                "candidate_physical_ue_indices cannot "
+                "use torch.bool."
+            )
+
+        resolved = (
+            candidate_physical_ue_indices
+        )
+
+    if resolved.device != h_freq.device:
+        raise ValueError(
+            "Physical UE indices and h_freq must be "
+            "on the same device."
+        )
+
+    return resolved.to(
+        dtype=torch.long,
+    )
+
+
+def _validate_selected_physical_ues(
+    *,
+    selected_physical_ues: torch.Tensor,
+    h_freq: torch.Tensor,
+    recommended_rank: torch.Tensor,
+    rx_combiners: torch.Tensor,
+) -> None:
+    """
+    Validate UE indices used to access the locally
+    stored PHY tensors.
+
+    Invalid padded candidate slots may contain -1,
+    but an actually selected UE may never do so.
+    """
+
+    if selected_physical_ues.numel() == 0:
+        return
+
+    if torch.any(
+        selected_physical_ues < 0
+    ):
+        raise ValueError(
+            "A selected candidate cannot have a "
+            "negative physical UE index."
+        )
+
+    num_phy_ues = int(
+        h_freq.shape[1]
+    )
+
+    if int(
+        recommended_rank.shape[1]
+    ) != num_phy_ues:
+        raise ValueError(
+            "recommended_rank and h_freq must use "
+            "the same physical UE dimension."
+        )
+
+    if int(
+        rx_combiners.shape[1]
+    ) != num_phy_ues:
+        raise ValueError(
+            "rx_combiners and h_freq must use the "
+            "same physical UE dimension."
+        )
+
+    if torch.any(
+        selected_physical_ues >= num_phy_ues
+    ):
+        raise ValueError(
+            "A selected physical UE index is outside "
+            "the stored PHY UE dimension."
+        )
+
+
+
 def evaluate_rbg_candidate_set(
     selected_candidate_indices: torch.Tensor,
     candidate_global_ue_indices: torch.Tensor,
@@ -138,6 +295,9 @@ def evaluate_rbg_candidate_set(
     link_adaptation_config: LinkAdaptationConfig,
     rate_config: RateConfig,
     batch_index: int = 0,
+    candidate_physical_ue_indices: (
+        torch.Tensor | None
+    ) = None,
 ) -> RBGAllocationEvaluationData:
     """
     Evaluate one hypothetical candidate set on one RBG.
@@ -169,6 +329,18 @@ def evaluate_rbg_candidate_set(
 
     num_candidates = int(
         candidate_global_ue_indices.numel()
+    )
+
+    physical_ue_indices = (
+        _resolve_candidate_physical_ue_indices(
+            candidate_global_ue_indices=(
+                candidate_global_ue_indices
+            ),
+            candidate_physical_ue_indices=(
+                candidate_physical_ue_indices
+            ),
+            h_freq=h_freq,
+        )
     )
 
     if torch.any(
@@ -293,17 +465,36 @@ def evaluate_rbg_candidate_set(
         ]
     )
 
+    selected_physical_ues = (
+        physical_ue_indices[
+            selected_candidate_indices
+        ]
+    )
+
+    _validate_selected_physical_ues(
+        selected_physical_ues=(
+            selected_physical_ues
+        ),
+        h_freq=h_freq,
+        recommended_rank=(
+            recommended_rank
+        ),
+        rx_combiners=(
+            rx_combiners
+        ),
+    )
+
     selected_ranks = (
         recommended_rank[
             batch_index,
-            selected_global_ues,
+            selected_physical_ues,
         ]
     )
 
     selected_rx_combiners = (
         rx_combiners[
             batch_index,
-            selected_global_ues,
+            selected_physical_ues,
             rbg_index,
             :,
             :,
@@ -323,7 +514,7 @@ def evaluate_rbg_candidate_set(
     selected_all_bs_channel = (
         h_freq[
             batch_index,
-            selected_global_ues,
+            selected_physical_ues,
             :,
             :,
             :,
@@ -331,7 +522,6 @@ def evaluate_rbg_candidate_set(
             first_subcarrier:last_subcarrier,
         ]
     )
-
 
     selected_all_bs_channel = (
         selected_all_bs_channel
@@ -685,6 +875,9 @@ def evaluate_cell_allocation(
     link_adaptation_config: LinkAdaptationConfig,
     rate_config: RateConfig,
     batch_index: int = 0,
+    candidate_physical_ue_indices: (
+        torch.Tensor | None
+    ) = None,
 ) -> CellAllocationEvaluationData:
     """
     Physically evaluate every RBG of one cell allocation.
@@ -746,7 +939,17 @@ def evaluate_cell_allocation(
     num_candidates = int(
         candidate_global_ue_indices.numel()
     )
-
+    physical_ue_indices = (
+        _resolve_candidate_physical_ue_indices(
+            candidate_global_ue_indices=(
+                candidate_global_ue_indices
+            ),
+            candidate_physical_ue_indices=(
+                candidate_physical_ue_indices
+            ),
+            h_freq=h_freq,
+        )
+    )
     num_rbgs = (
         allocation.num_rbgs
     )
@@ -864,6 +1067,25 @@ def evaluate_cell_allocation(
             ]
         )
 
+        selected_physical_ues = (
+            physical_ue_indices[
+                selected_candidate_indices
+            ]
+        )
+
+        _validate_selected_physical_ues(
+            selected_physical_ues=(
+                selected_physical_ues
+            ),
+            h_freq=h_freq,
+            recommended_rank=(
+                recommended_rank
+            ),
+            rx_combiners=(
+                rx_combiners
+            ),
+        )
+
         num_selected_ues = int(
             selected_global_ues.numel()
         )
@@ -875,14 +1097,14 @@ def evaluate_cell_allocation(
         selected_ranks = (
             recommended_rank[
                 batch_index,
-                selected_global_ues,
+                selected_physical_ues,
             ]
         )
 
         selected_rx_combiners = (
             rx_combiners[
                 batch_index,
-                selected_global_ues,
+                selected_physical_ues,
                 rbg_index,
                 :,
                 :,
@@ -910,7 +1132,7 @@ def evaluate_cell_allocation(
         selected_all_bs_channel = (
             h_freq[
                 batch_index,
-                selected_global_ues,
+                selected_physical_ues,
                 :,
                 :,
                 :,

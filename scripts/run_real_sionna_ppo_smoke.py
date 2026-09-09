@@ -41,11 +41,11 @@ from oran_scheduler.rl.ppo_multistream_update import (
 from oran_scheduler.rl.ppo_reward import (
     PPORewardConfig,
 )
-from oran_scheduler.rl.ppo_sionna_snapshot import (
-    FixedSionnaPPOSnapshotConfig,
-    IndependentSionnaPPOTTIInputProvider,
-    build_fixed_sionna_ppo_snapshot,
-    build_snapshot_state_managers,
+from oran_scheduler.rl.ppo_sionna_chunked import (
+    CellChunkedSionnaPPOInputProvider,
+    ChunkedSionnaPPOConfig,
+    build_chunked_sionna_ppo_context,
+    build_chunked_state_managers,
 )
 from oran_scheduler.rl.ppo_training_runner import (
     PPOTrainingRunnerConfig,
@@ -98,16 +98,14 @@ NUM_RBGS = 18
 NUM_USER_SLOTS = 4
 
 
-# --------------------------------------------------------------
-# TEMPORARY SCAFFOLDING:
+# PAPER-SPECIFIED full centralized training network.
+NUM_TRAINING_CELLS = 21
+
+
+# Scalability probe only:
 #
-# First real-radio integration:
-#     only two centralized cells.
-# --------------------------------------------------------------
-
-NUM_TRAINING_CELLS = 2
-
-NUM_TTIS = 2
+# advance exactly one paper-sized warm-up TTI.
+NUM_TTIS = 1
 
 
 # --------------------------------------------------------------
@@ -129,11 +127,12 @@ NUM_TTIS = 2
 # This is NOT the final reproduction setting.
 # --------------------------------------------------------------
 
-UPDATE_SIZE = (
-    NUM_TRAINING_CELLS
-    * NUM_USER_SLOTS
-)
-
+# PAPER-SPECIFIED.
+#
+# This value is inactive during the warm-up-only
+# scalability run because no PPO experience is
+# collected before TTI 100.
+UPDATE_SIZE = 128
 
 # --------------------------------------------------------------
 # OPEN-REPRODUCTION PARAMETERS.
@@ -218,6 +217,12 @@ EXPERT_AUGMENTATION_SEED = 2222
 TTI_DURATION_S = 0.5e-3
 
 
+# PAPER-SPECIFIED:
+#
+# normal agent-sample collection begins after
+# the initial 100 TTIs.
+FIRST_COLLECTION_TTI_INDEX = 100
+
 
 def module_parameter_norm(
     module: torch.nn.Module,
@@ -248,7 +253,7 @@ def module_parameter_norm(
 
 
 def build_mixed_training_traffic_managers(
-    snapshot,
+    serving_global_ue_indices_by_stream,
 ) -> tuple[
     tuple[
         TrafficBufferManager,
@@ -275,14 +280,13 @@ def build_mixed_training_traffic_managers(
         We alternate FB / FTP3 across REAL serving
         UEs in global stream order.
 
-        With the current snapshot:
+TEMPORARY SMOKE-RUN CHOICE:
+    Alternate FB / FTP3 across all REAL serving UEs
+    of the selected PPO streams.
 
-            Cell stream 0: 3 real UEs
-            Cell stream 1: 3 real UEs
-
-        giving:
-
-            6 real UEs total
+    The assignment counter spans streams, which keeps
+    the overall selected-UE population approximately
+    50% Full Buffer and 50% FTP3.
             3 FB
             3 FTP3
 
@@ -323,12 +327,18 @@ def build_mixed_training_traffic_managers(
     #
     real_ue_ordinal = 0
 
-    for stream_index, observation in enumerate(
-        snapshot.observations
+    for (
+        stream_index,
+        global_ue_indices,
+    ) in enumerate(
+        serving_global_ue_indices_by_stream
     ):
-        valid_mask = (
-            observation
-            .serving_ue_valid_mask
+        valid_mask = torch.ones(
+            global_ue_indices.shape,
+            dtype=torch.bool,
+            device=(
+                global_ue_indices.device
+            ),
         )
 
         full_buffer_mask = (
@@ -377,23 +387,42 @@ def build_mixed_training_traffic_managers(
         # one packet so the queue-limited delivery
         # path is definitely exercised.
         #
-        initial_ftp_buffer_bits = torch.where(
-            ftp3_mask,
-            torch.full(
-                valid_mask.shape,
-                fill_value=(
-                    ftp3_config
-                    .packet_size_bits
-                ),
-                dtype=torch.float32,
-                device=valid_mask.device,
-            ),
-            torch.zeros(
-                valid_mask.shape,
-                dtype=torch.float32,
-                device=valid_mask.device,
-            ),
-        )
+        # initial_ftp_buffer_bits = torch.where(
+        #     ftp3_mask,
+        #     torch.full(
+        #         valid_mask.shape,
+        #         fill_value=(
+        #             ftp3_config
+        #             .packet_size_bits
+        #         ),
+        #         dtype=torch.float32,
+        #         device=valid_mask.device,
+        #     ),
+        #     torch.zeros(
+        #         valid_mask.shape,
+        #         dtype=torch.float32,
+        #         device=valid_mask.device,
+        #     ),
+        # )
+
+        # manager = TrafficBufferManager(
+        #     full_buffer_mask=(
+        #         full_buffer_mask
+        #     ),
+        #     ftp3_config=(
+        #         ftp3_config
+        #     ),
+        #     full_buffer_state_bits=(
+        #         FULL_BUFFER_STATE_BITS
+        #     ),
+        #     initial_ftp_buffer_bits=(
+        #         initial_ftp_buffer_bits
+        #     ),
+        #     seed=(
+        #         SEED
+        #         + stream_index
+        #     ),
+        # )
 
         manager = TrafficBufferManager(
             full_buffer_mask=(
@@ -405,9 +434,7 @@ def build_mixed_training_traffic_managers(
             full_buffer_state_bits=(
                 FULL_BUFFER_STATE_BITS
             ),
-            initial_ftp_buffer_bits=(
-                initial_ftp_buffer_bits
-            ),
+            initial_ftp_buffer_bits=None,
             seed=(
                 SEED
                 + stream_index
@@ -473,13 +500,19 @@ def main() -> None:
         f"{NUM_RBGS}"
     )
 
+    # print(
+    #     f"Smoke update size:      "
+    #     f"{UPDATE_SIZE}"
+    # )
+
     print(
-        f"Smoke update size:      "
+        "PPO update size M:      "
         f"{UPDATE_SIZE}"
     )
 
     print(
-        "Expert guidance:        enabled"
+        "Expert guidance:        configured, "
+        "inactive during warm-up"
     )
 
     print(
@@ -493,10 +526,25 @@ def main() -> None:
         "(open-reproduction)"
     )
 
+    # print(
+    #     "Permutation:            "
+    #     "original + "
+    #     f"{NUM_CANDIDATE_PERMUTATIONS}"
+    # )
+
     print(
-        "Permutation:            "
-        "original + "
-        f"{NUM_CANDIDATE_PERMUTATIONS}"
+        "Permutation:            configured, "
+        "inactive during warm-up"
+    )
+
+    print(
+        "Collection starts TTI:  "
+        f"{FIRST_COLLECTION_TTI_INDEX}"
+    )
+
+    print(
+        "Run type:               "
+        "21-cell warm-up scalability"
     )
 
     print(
@@ -521,31 +569,52 @@ def main() -> None:
     print("=" * 72)
     print()
 
-    snapshot_start = (
+    # snapshot_start = (
+    #     time.perf_counter()
+    # )
+
+    # ==========================================================
+    # PAPER-SCALE TRAINING POPULATION
+    #
+    # 21 cells
+    # x
+    # 20 generated UEs / sector
+    # =
+    # 420 UEs
+    #
+    # Only NUM_TRAINING_CELLS streams are executed
+    # in THIS first chunked smoke run.
+    # ==========================================================
+
+    context_start = (
         time.perf_counter()
     )
 
-    snapshot = (
-        build_fixed_sionna_ppo_snapshot(
+    context = (
+        build_chunked_sionna_ppo_context(
             config=(
-                FixedSionnaPPOSnapshotConfig(
+                ChunkedSionnaPPOConfig(
                     num_training_cells=(
                         NUM_TRAINING_CELLS
                     ),
 
                     #
-                    # TEMPORARY MEMORY-SAFE RADIO
-                    # LOAD:
+                    # PAPER-SPECIFIED.
                     #
-                    # 1 UE/sector -> 21 total UEs.
-                    #
-                    num_ut_per_sector=1,
+                    num_ut_per_sector=20,
 
                     num_rbs=18,
+
                     num_rbgs=18,
+
                     subcarriers_per_rb=12,
+
                     topology_seed=42,
-                    channel_seed=42,
+
+                    association_channel_seed=1000,
+
+                    mimo_channel_seed=2000,
+
                     device="cuda:0",
                 )
             )
@@ -556,93 +625,210 @@ def main() -> None:
         DEVICE
     )
 
-    snapshot_elapsed = (
+    context_elapsed = (
         time.perf_counter()
-        - snapshot_start
+        - context_start
     )
 
     print(
-        "Real channel shape:      "
-        f"{tuple(snapshot.h_freq.shape)}"
+        "Complete topology UEs:   "
+        f"{context.num_global_ues}"
     )
 
     print(
-        "Selected real cells:     "
-        f"{snapshot.selected_cell_indices}"
+        "Complete topology cells: "
+        f"{context.num_cells}"
     )
 
     print(
-        "Associated UEs/stream:   "
-        f"{snapshot.selected_num_ues_per_cell}"
+        "Selected PPO cells:      "
+        f"{context.selected_cell_indices}"
+    )
+
+    test_to_print_temp = f"{tuple( int(indices.numel()) for indices in context.global_ue_indices_by_stream )}"
+    print(
+        "UEs in selected cells:   "
+        f"{test_to_print_temp}"
     )
 
     print(
-        "Snapshot build time:     "
-        f"{snapshot_elapsed:.3f} s"
+        "Context build time:      "
+        f"{context_elapsed:.3f} s"
     )
 
     print()
 
-    for stream_index, observation in enumerate(
-        snapshot.observations
-    ):
-        print(
-            f"Stream {stream_index}:"
-        )
 
-        print(
-            "  real cell:            "
-            f"{snapshot.selected_cell_indices[stream_index]}"
-        )
+    # ==========================================================
+    # CHUNKED PAPER-MIMO PROVIDER
+    # ==========================================================
 
-        print(
-            "  serving layout:       "
-            f"{tuple(observation.serving_global_ue_indices.shape)}"
+    radio_input_provider = (
+        CellChunkedSionnaPPOInputProvider(
+            context=context
         )
+    )
 
-        print(
-            "  real serving UEs:     "
-            f"{int(observation.serving_ue_valid_mask.sum().item())}"
-        )
+    #
+    # Generate TTI 0 now because persistent traffic
+    # and PF-history managers need the serving UE
+    # identity vectors.
+    #
+    # radio_input_provider.prepare_tti(
+    #     0
+    # )
 
-        print(
-            "  subband CQI:          "
-            f"{tuple(observation.subband_cqi.shape)}"
-        )
+    # print(
+    #     "Initial chunk observations:"
+    # )
 
-        print(
-            "  precoder directions:  "
-            f"{tuple(observation.precoder_directions.shape)}"
-        )
+    # for (
+    #     stream_index,
+    #     observation,
+    # ) in enumerate(
+    #     radio_input_provider
+    #     .current_observations
+    # ):
+    #     real_cell = (
+    #         context
+    #         .selected_cell_indices[
+    #             stream_index
+    #         ]
+    #     )
 
-        print()
+    #     print(
+    #         f"  stream {stream_index}: "
+    #         f"real cell {real_cell}, "
+    #         f"{int(observation.serving_ue_valid_mask.sum().item())} UEs"
+    #     )
+
+    #     print(
+    #         "    precoder directions: "
+    #         f"{tuple(observation.precoder_directions.shape)}"
+    #     )
+
+    # print()
 
 
     # ==========================================================
-    # PERSISTENT CELL STATE
+    # PERSISTENT PF HISTORY
     # ==========================================================
 
     state_managers = (
-        build_snapshot_state_managers(
-            snapshot=snapshot,
+        build_chunked_state_managers(
+            context=context,
+
             initial_average_throughput_bps=(
                 INITIAL_AVERAGE_THROUGHPUT_BPS
             ),
+
             throughput_forgetting_factor=(
                 THROUGHPUT_FORGETTING_FACTOR
             ),
+
             num_candidates=(
                 NUM_CANDIDATES
             ),
         )
     )
 
+
+    input_provider = (
+        radio_input_provider
+    )
+
+    # torch.cuda.synchronize(
+    #     DEVICE
+    # )
+
+    # snapshot_elapsed = (
+    #     time.perf_counter()
+    #     - snapshot_start
+    # )
+
+    # print(
+    #     "Real channel shape:      "
+    #     f"{tuple(snapshot.h_freq.shape)}"
+    # )
+
+    # print(
+    #     "Selected real cells:     "
+    #     f"{snapshot.selected_cell_indices}"
+    # )
+
+    # print(
+    #     "Associated UEs/stream:   "
+    #     f"{snapshot.selected_num_ues_per_cell}"
+    # )
+
+    # print(
+    #     "Snapshot build time:     "
+    #     f"{snapshot_elapsed:.3f} s"
+    # )
+
+    # print()
+
+    # for stream_index, observation in enumerate(
+    #     snapshot.observations
+    # ):
+    #     print(
+    #         f"Stream {stream_index}:"
+    #     )
+
+    #     print(
+    #         "  real cell:            "
+    #         f"{snapshot.selected_cell_indices[stream_index]}"
+    #     )
+
+    #     print(
+    #         "  serving layout:       "
+    #         f"{tuple(observation.serving_global_ue_indices.shape)}"
+    #     )
+
+    #     print(
+    #         "  real serving UEs:     "
+    #         f"{int(observation.serving_ue_valid_mask.sum().item())}"
+    #     )
+
+    #     print(
+    #         "  subband CQI:          "
+    #         f"{tuple(observation.subband_cqi.shape)}"
+    #     )
+
+    #     print(
+    #         "  precoder directions:  "
+    #         f"{tuple(observation.precoder_directions.shape)}"
+    #     )
+
+    #     print()
+
+
+    # # ==========================================================
+    # # PERSISTENT CELL STATE
+    # # ==========================================================
+
+    # state_managers = (
+    #     build_snapshot_state_managers(
+    #         snapshot=snapshot,
+    #         initial_average_throughput_bps=(
+    #             INITIAL_AVERAGE_THROUGHPUT_BPS
+    #         ),
+    #         throughput_forgetting_factor=(
+    #             THROUGHPUT_FORGETTING_FACTOR
+    #         ),
+    #         num_candidates=(
+    #             NUM_CANDIDATES
+    #         ),
+    #     )
+    # )
+
     (
         traffic_managers,
         full_buffer_masks,
     ) = (
         build_mixed_training_traffic_managers(
-            snapshot
+            context
+            .global_ue_indices_by_stream
         )
     )
 
@@ -658,13 +844,15 @@ def main() -> None:
 
     num_real_ues = sum(
         int(
-            observation
-            .serving_ue_valid_mask
-            .sum()
-            .item()
+            global_ue_indices
+            .numel()
         )
-        for observation
-        in snapshot.observations
+
+        for global_ue_indices
+        in (
+            context
+            .global_ue_indices_by_stream
+        )
     )
 
     num_ftp3_ues = (
@@ -693,33 +881,33 @@ def main() -> None:
 
     print()
 
-    radio_input_provider = (
-        IndependentSionnaPPOTTIInputProvider(
-            initial_snapshot=(
-                snapshot
-            ),
-            initial_tti_index=0,
-        )
-    )
+    # radio_input_provider = (
+    #     IndependentSionnaPPOTTIInputProvider(
+    #         initial_snapshot=(
+    #             snapshot
+    #         ),
+    #         initial_tti_index=0,
+    #     )
+    # )
 
-    input_provider = (
-        radio_input_provider
-    )
+    # input_provider = (
+    #     radio_input_provider
+    # )
 
-    # ==========================================================
-    # DROP THE EXTRA LOCAL REFERENCE
-    # ==========================================================
-    #
-    # radio_input_provider now owns the initial snapshot.
-    #
-    # We no longer need the separate local variable
-    # `snapshot`.
-    #
-    # At TTI 1, when radio_input_provider replaces its
-    # current snapshot with the refreshed one, the old
-    # large H tensor can then become eligible for release.
-    #
-    del snapshot
+    # # ==========================================================
+    # # DROP THE EXTRA LOCAL REFERENCE
+    # # ==========================================================
+    # #
+    # # radio_input_provider now owns the initial snapshot.
+    # #
+    # # We no longer need the separate local variable
+    # # `snapshot`.
+    # #
+    # # At TTI 1, when radio_input_provider replaces its
+    # # current snapshot with the refreshed one, the old
+    # # large H tensor can then become eligible for release.
+    # #
+    # del snapshot
 
     # ==========================================================
     # PAPER-SHAPED 1LDS STATE
@@ -919,9 +1107,8 @@ def main() -> None:
     # ==========================================================
     # CENTRAL LEARNER
     #
-    # Teacher 2 and candidate permutation are
-    # deliberately OFF for this first real-radio
-    # integration run.
+    # PPO candidate permutation + PF expert/JSD
+    # are both enabled.
     # ==========================================================
 
     centralized_training = (
@@ -1101,9 +1288,17 @@ def main() -> None:
             # two-TTI integration run can prove that
             # an optimizer update really occurs.
             #
+            # runner_config=(
+            #     PPOTrainingRunnerConfig(
+            #         first_collection_tti_index=0,
+            #     )
+            # ),
+
             runner_config=(
                 PPOTrainingRunnerConfig(
-                    first_collection_tti_index=0,
+                    first_collection_tti_index=(
+                        FIRST_COLLECTION_TTI_INDEX
+                    ),
                 )
             ),
 
@@ -1135,14 +1330,23 @@ def main() -> None:
             DEVICE
         )
 
-        current_radio = (
+        print(
+            "  chunked TTI builds:   "
+            f"{radio_input_provider.num_tti_builds}"
+        )
+
+        print(
+            "  cell chunk builds:    "
+            f"{radio_input_provider.num_stream_builds}"
+        )
+
+        current_observations = (
             radio_input_provider
-            .current_snapshot
+            .current_observations
         )
 
         example_observation = (
-            current_radio
-            .observations[
+            current_observations[
                 0
             ]
         )
@@ -1169,6 +1373,16 @@ def main() -> None:
             ]
             .mean()
             .item()
+        )
+
+        print(
+            "  stream-0 mean TD rate:"
+            f" {mean_td_rate_mbps:.3f} Mbps"
+        )
+
+        print(
+            "  stream-0 mean WB CQI: "
+            f"{mean_wideband_cqi:.3f}"
         )
 
         elapsed = (
@@ -1250,14 +1464,34 @@ def main() -> None:
             f"{peak_memory_mib:.1f} MiB"
         )
 
+    # print(
+    #     "Cell chunk builds:       "
+    #     f"{radio_input_provider.num_stream_builds}"
+    # )
+
+        # print(
+        #     "  radio channel seed:   "
+        #     f"{current_radio.channel_seed_used}"
+        # )
+
+        # print(
+        #     "  channel refreshes:    "
+        #     f"{radio_input_provider.num_channel_refreshes}"
+        # )
+
         print(
-            "  radio channel seed:   "
-            f"{current_radio.channel_seed_used}"
+            "  chunked TTI builds:   "
+            f"{radio_input_provider.num_tti_builds}"
         )
 
         print(
-            "  channel refreshes:    "
-            f"{radio_input_provider.num_channel_refreshes}"
+            "  stream-0 mean TD rate:"
+            f" {mean_td_rate_mbps:.3f} Mbps"
+        )
+
+        print(
+            "  stream-0 mean WB CQI: "
+            f"{mean_wideband_cqi:.3f}"
         )
 
         print(
@@ -1386,6 +1620,31 @@ def main() -> None:
     )
 
     print(
+        "Global training population: "
+        "420 UEs"
+    )
+
+    print(
+        "Paper MIMO storage:       "
+        "serving-cell chunks"
+    )
+
+    print(
+        "BS links per chunk:       "
+        "all 21"
+    )
+
+    print(
+        "PPO streams this smoke:   "
+        f"{NUM_TRAINING_CELLS}"
+    )
+
+    print(
+        "Radio evolution:          "
+        "new chunked realization / TTI"
+    )
+
+    print(
         "PPO optimizer updates:   "
         f"{centralized_training.num_updates}"
     )
@@ -1410,76 +1669,130 @@ def main() -> None:
         f"{final_critic_norm:.8f}"
     )
 
+    print(
+        "Cell chunk builds:       "
+        f"{radio_input_provider.num_stream_builds}"
+    )
+
     print()
+
+    # if (
+    #     centralized_training
+    #     .num_updates
+    #     != 1
+    # ):
+    #     raise RuntimeError(
+    #         "Expected exactly one centralized PPO "
+    #         "update in the two-TTI smoke run."
+    #     )
 
     if (
         centralized_training
         .num_updates
-        != 1
+        != 0
     ):
         raise RuntimeError(
-            "Expected exactly one centralized PPO "
-            "update in the two-TTI smoke run."
+            "Warm-up scalability run unexpectedly "
+            "performed a PPO optimizer update."
         )
+
+    # if (
+    #     centralized_training
+    #     .num_expert_guidance_updates
+    #     != 1
+    # ):
+    #     raise RuntimeError(
+    #         "Expected exactly one PF-expert/JSD "
+    #         "update in the two-TTI smoke run."
+    #     )
 
     if (
         centralized_training
         .num_expert_guidance_updates
-        != 1
+        != 0
     ):
         raise RuntimeError(
-            "Expected exactly one PF-expert/JSD "
-            "update in the two-TTI smoke run."
+            "Warm-up scalability run unexpectedly "
+            "performed a PF-expert/JSD update."
         )
 
+
+    # if len(
+    #     expert_buffer
+    # ) == 0:
+    #     raise RuntimeError(
+    #         "PF expert did not populate D_expert."
+    #     )
 
     if len(
         expert_buffer
-    ) == 0:
+    ) != 0:
         raise RuntimeError(
-            "PF expert did not populate D_expert."
+            "PF expert demonstrations were collected "
+            "during pre-collection warm-up."
         )
 
 
-    last_update = (
+    # last_update = (
+    #     centralized_training
+    #     .last_update
+    # )
+
+    # if last_update is None:
+    #     raise RuntimeError(
+    #         "Missing final PPO update diagnostics."
+    #     )
+
+
+    # expected_optimizer_samples = (
+    #     UPDATE_SIZE
+    #     * (
+    #         int(
+    #             INCLUDE_ORIGINAL_SAMPLE
+    #         )
+    #         + NUM_CANDIDATE_PERMUTATIONS
+    #     )
+    # )
+
+    # if (
+    #     last_update
+    #     .num_optimizer_samples
+    #     != expected_optimizer_samples
+    # ):
+    #     raise RuntimeError(
+    #         "Candidate augmentation produced the "
+    #         "wrong PPO optimizer sample count."
+    #     )
+
+
+    # if (
+    #     last_update.expert_update
+    #     is None
+    # ):
+    #     raise RuntimeError(
+    #         "Expected a Teacher-2 update."
+    #     )
+
+
+    if (
         centralized_training
         .last_update
-    )
-
-    if last_update is None:
-        raise RuntimeError(
-            "Missing final PPO update diagnostics."
-        )
-
-
-    expected_optimizer_samples = (
-        UPDATE_SIZE
-        * (
-            int(
-                INCLUDE_ORIGINAL_SAMPLE
-            )
-            + NUM_CANDIDATE_PERMUTATIONS
-        )
-    )
-
-    if (
-        last_update
-        .num_optimizer_samples
-        != expected_optimizer_samples
+        is not None
     ):
         raise RuntimeError(
-            "Candidate augmentation produced the "
-            "wrong PPO optimizer sample count."
+            "Warm-up scalability run unexpectedly "
+            "stored optimizer-update diagnostics."
         )
-
 
     if (
-        last_update.expert_update
-        is None
+        transition_buffer.num_transitions
+        != 0
     ):
         raise RuntimeError(
-            "Expected a Teacher-2 update."
+            "Agent transitions were collected during "
+            "pre-collection warm-up."
         )
+
 
     if not torch.isfinite(
         torch.tensor(
@@ -1494,19 +1807,48 @@ def main() -> None:
             "Network parameters became non-finite."
         )
 
-    expected_channel_refreshes = (
+    # expected_channel_refreshes = (
+    #     NUM_TTIS
+    #     - 1
+    # )
+
+    # if (
+    #     radio_input_provider
+    #     .num_channel_refreshes
+    #     != expected_channel_refreshes
+    # ):
+    #     raise RuntimeError(
+    #         "Unexpected number of Sionna channel "
+    #         "refreshes."
+    #     )
+
+    expected_stream_builds = (
         NUM_TTIS
-        - 1
+        * NUM_TRAINING_CELLS
     )
 
     if (
         radio_input_provider
-        .num_channel_refreshes
-        != expected_channel_refreshes
+        .num_stream_builds
+        != expected_stream_builds
     ):
         raise RuntimeError(
-            "Unexpected number of Sionna channel "
-            "refreshes."
+            "Unexpected number of lazy cell "
+            "Sionna chunk builds."
+        )
+
+    expected_tti_builds = (
+        NUM_TTIS
+    )
+
+    if (
+        radio_input_provider
+        .num_tti_builds
+        != expected_tti_builds
+    ):
+        raise RuntimeError(
+            "Unexpected number of chunked Sionna "
+            "TTI builds."
         )
 
     print(
@@ -1524,14 +1866,29 @@ def main() -> None:
         f"{len(expert_buffer)}"
     )
 
+    # print(
+    #     "Optimizer rows/update:   "
+    #     f"{last_update.num_optimizer_samples}"
+    # )
+
     print(
-        "Optimizer rows/update:   "
-        f"{last_update.num_optimizer_samples}"
+        "Collection start TTI:    "
+        f"{FIRST_COLLECTION_TTI_INDEX}"
     )
 
     print(
-        "Channel refreshes:       "
-        f"{radio_input_provider.num_channel_refreshes}"
+        "Warm-up PPO updates:     "
+        f"{centralized_training.num_updates}"
+    )
+
+    print(
+        "Warm-up expert updates:  "
+        f"{centralized_training.num_expert_guidance_updates}"
+    )
+
+    print(
+        "Chunked TTI builds:      "
+        f"{radio_input_provider.num_tti_builds}"
     )
 
     print("=" * 72)

@@ -322,3 +322,156 @@ def test_candidate_order_is_preserved_in_cache(
     )
 
 
+def test_physical_scorer_forwards_local_ue_mapping(
+    monkeypatch,
+):
+    calls = []
+
+    def fake_evaluate_rbg_candidate_set(
+        **kwargs,
+    ):
+        calls.append(
+            kwargs
+        )
+
+        return SimpleNamespace(
+            total_target_compliant_rate_bps=(
+                torch.tensor(
+                    9.0,
+                    dtype=torch.float32,
+                )
+            ),
+            target_compliant_rate_bps=(
+                torch.tensor(
+                    [
+                        9.0,
+                    ],
+                    dtype=torch.float32,
+                )
+            ),
+        )
+
+    monkeypatch.setattr(
+        (
+            "oran_scheduler.rl."
+            "ppo_physical_score."
+            "evaluate_rbg_candidate_set"
+        ),
+        fake_evaluate_rbg_candidate_set,
+    )
+
+    base = build_inputs()
+
+    inputs = PPOPhysicalScoreInputs(
+        candidate_global_ue_indices=(
+            torch.tensor(
+                [
+                    103,
+                    151,
+                    317,
+                ],
+                dtype=torch.long,
+            )
+        ),
+
+        candidate_physical_ue_indices=(
+            torch.tensor(
+                [
+                    0,
+                    1,
+                    2,
+                ],
+                dtype=torch.long,
+            )
+        ),
+
+        h_freq=base.h_freq,
+
+        serving_cell_index=(
+            base.serving_cell_index
+        ),
+
+        recommended_rank=(
+            base.recommended_rank
+        ),
+
+        rx_combiners=(
+            base.rx_combiners
+        ),
+
+        csi_subcarrier_index=(
+            base.csi_subcarrier_index
+        ),
+
+        subcarriers_per_rbg=(
+            base.subcarriers_per_rbg
+        ),
+
+        tx_power_per_subcarrier_w=(
+            base.tx_power_per_subcarrier_w
+        ),
+
+        noise_power_per_subcarrier_w=(
+            base.noise_power_per_subcarrier_w
+        ),
+
+        link_adaptation_config=(
+            base.link_adaptation_config
+        ),
+
+        rate_config=(
+            base.rate_config
+        ),
+
+        batch_index=(
+            base.batch_index
+        ),
+    )
+
+    scorer = (
+        CachedPPOPhysicalRBGScorer(
+            inputs
+        )
+    )
+
+    scorer(
+        torch.tensor(
+            [
+                1,
+            ],
+            dtype=torch.long,
+        ),
+        0,
+    )
+
+    assert len(
+        calls
+    ) == 1
+
+    torch.testing.assert_close(
+        calls[0][
+            "candidate_global_ue_indices"
+        ],
+        torch.tensor(
+            [
+                103,
+                151,
+                317,
+            ],
+            dtype=torch.long,
+        ),
+    )
+
+    torch.testing.assert_close(
+        calls[0][
+            "candidate_physical_ue_indices"
+        ],
+        torch.tensor(
+            [
+                0,
+                1,
+                2,
+            ],
+            dtype=torch.long,
+        ),
+    )
