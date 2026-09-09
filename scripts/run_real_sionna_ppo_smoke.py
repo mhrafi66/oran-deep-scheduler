@@ -98,14 +98,29 @@ NUM_RBGS = 18
 NUM_USER_SLOTS = 4
 
 
-# PAPER-SPECIFIED full centralized training network.
-NUM_TRAINING_CELLS = 21
+# # PAPER-SPECIFIED full centralized training network.
+# NUM_TRAINING_CELLS = 21
+
+# TEMPORARY KINGSPEAK DEVELOPMENT CONFIG.
+#
+# OPEN-REPRODUCTION ENGINEERING:
+# Execute only two PPO cell streams while retaining
+# the complete 420-UE / 21-cell global topology.
+NUM_TRAINING_CELLS = 2
+
+#
+# OPEN-REPRODUCTION ENGINEERING.
+#
+# Maximum number of serving UEs passed to one
+# paper-array Sionna generation call.
+#
+UE_MICROBATCH_SIZE = 2
 
 
 # Scalability probe only:
 #
 # advance exactly one paper-sized warm-up TTI.
-NUM_TTIS = 1
+NUM_TTIS = 2
 
 
 # --------------------------------------------------------------
@@ -127,12 +142,20 @@ NUM_TTIS = 1
 # This is NOT the final reproduction setting.
 # --------------------------------------------------------------
 
-# PAPER-SPECIFIED.
+# # PAPER-SPECIFIED.
+# #
+# # This value is inactive during the warm-up-only
+# # scalability run because no PPO experience is
+# # collected before TTI 100.
+# UPDATE_SIZE = 128
+
+# TEST-SCALE ONLY.
 #
-# This value is inactive during the warm-up-only
-# scalability run because no PPO experience is
-# collected before TTI 100.
-UPDATE_SIZE = 128
+# 2 cells x 4 user slots = 8 transitions at the
+# first cross-TTI update boundary.
+#
+# Paper uses M = 128.
+UPDATE_SIZE = 8
 
 # --------------------------------------------------------------
 # OPEN-REPRODUCTION PARAMETERS.
@@ -217,12 +240,20 @@ EXPERT_AUGMENTATION_SEED = 2222
 TTI_DURATION_S = 0.5e-3
 
 
-# PAPER-SPECIFIED:
-#
-# normal agent-sample collection begins after
-# the initial 100 TTIs.
-FIRST_COLLECTION_TTI_INDEX = 100
+# # PAPER-SPECIFIED:
+# #
+# # normal agent-sample collection begins after
+# # the initial 100 TTIs.
+# FIRST_COLLECTION_TTI_INDEX = 100
 
+
+# TEST-SCALE ONLY.
+#
+# Start collection immediately so this short
+# real-Sionna run proves an actual PPO/JSD update.
+#
+# Paper uses first_collection_tti_index = 100.
+FIRST_COLLECTION_TTI_INDEX = 0
 
 def module_parameter_norm(
     module: torch.nn.Module,
@@ -500,6 +531,12 @@ def main() -> None:
         f"{NUM_RBGS}"
     )
 
+    print(
+        "UE microbatch size:      "
+        f"{UE_MICROBATCH_SIZE} "
+        "(open-reproduction)"
+    )
+
     # print(
     #     f"Smoke update size:      "
     #     f"{UPDATE_SIZE}"
@@ -608,6 +645,10 @@ def main() -> None:
                     num_rbgs=18,
 
                     subcarriers_per_rb=12,
+
+                    ue_microbatch_size=(
+                        UE_MICROBATCH_SIZE
+                    ),
 
                     topology_seed=42,
 
@@ -1686,15 +1727,17 @@ def main() -> None:
     #         "update in the two-TTI smoke run."
     #     )
 
-    if (
-        centralized_training
-        .num_updates
-        != 0
-    ):
-        raise RuntimeError(
-            "Warm-up scalability run unexpectedly "
-            "performed a PPO optimizer update."
-        )
+    # if (
+    #     centralized_training
+    #     .num_updates
+    #     != 0
+    # ):
+    #     raise RuntimeError(
+    #         "Warm-up scalability run unexpectedly "
+    #         "performed a PPO optimizer update."
+    #     )
+
+
 
     # if (
     #     centralized_training
@@ -1706,15 +1749,15 @@ def main() -> None:
     #         "update in the two-TTI smoke run."
     #     )
 
-    if (
-        centralized_training
-        .num_expert_guidance_updates
-        != 0
-    ):
-        raise RuntimeError(
-            "Warm-up scalability run unexpectedly "
-            "performed a PF-expert/JSD update."
-        )
+    # if (
+    #     centralized_training
+    #     .num_expert_guidance_updates
+    #     != 0
+    # ):
+    #     raise RuntimeError(
+    #         "Warm-up scalability run unexpectedly "
+    #         "performed a PF-expert/JSD update."
+    #     )
 
 
     # if len(
@@ -1724,13 +1767,13 @@ def main() -> None:
     #         "PF expert did not populate D_expert."
     #     )
 
-    if len(
-        expert_buffer
-    ) != 0:
-        raise RuntimeError(
-            "PF expert demonstrations were collected "
-            "during pre-collection warm-up."
-        )
+    # if len(
+    #     expert_buffer
+    # ) != 0:
+    #     raise RuntimeError(
+    #         "PF expert demonstrations were collected "
+    #         "during pre-collection warm-up."
+    #     )
 
 
     # last_update = (
@@ -1774,23 +1817,117 @@ def main() -> None:
     #     )
 
 
-    if (
-        centralized_training
-        .last_update
-        is not None
-    ):
-        raise RuntimeError(
-            "Warm-up scalability run unexpectedly "
-            "stored optimizer-update diagnostics."
-        )
+    # if (
+    #     centralized_training
+    #     .last_update
+    #     is not None
+    # ):
+    #     raise RuntimeError(
+    #         "Warm-up scalability run unexpectedly "
+    #         "stored optimizer-update diagnostics."
+    #     )
+
+    # if (
+    #     transition_buffer.num_transitions
+    #     != 0
+    # ):
+    #     raise RuntimeError(
+    #         "Agent transitions were collected during "
+    #         "pre-collection warm-up."
+    #     )
+
+    # if (
+    #     len(transition_buffer)
+    #     != 0
+    # ):
+    #     raise RuntimeError(
+    #         "Agent transitions were collected during "
+    #         "pre-collection warm-up."
+    #     )
+
+    # ==============================================================
+    # TEST-SCALE REAL-LEARNING VALIDATION
+    #
+    # OPEN-REPRODUCTION INTEGRATION TEST:
+    #
+    #   2 centralized streams
+    #   4 1LDS user slots / stream
+    #   collection from TTI 0
+    #   update_size = 8
+    #
+    # TTI 0 produces the within-TTI transitions.
+    # At the start of TTI 1, the cross-TTI boundaries are
+    # resolved and the centralized buffer reaches 8.
+    #
+    # We therefore expect exactly one PPO update and one
+    # PF-expert/JSD update.
+    # ==============================================================
 
     if (
-        transition_buffer.num_transitions
-        != 0
+        centralized_training.num_updates
+        != 1
     ):
         raise RuntimeError(
-            "Agent transitions were collected during "
-            "pre-collection warm-up."
+            "Expected exactly one centralized PPO "
+            "update in the two-TTI learning smoke."
+        )
+
+
+    if (
+        centralized_training
+        .num_expert_guidance_updates
+        != 1
+    ):
+        raise RuntimeError(
+            "Expected exactly one PF-expert/JSD "
+            "update in the two-TTI learning smoke."
+        )
+
+
+    if len(
+        expert_buffer
+    ) == 0:
+        raise RuntimeError(
+            "PF expert did not populate D_expert."
+        )
+
+
+    last_update = (
+        centralized_training.last_update
+    )
+
+    if last_update is None:
+        raise RuntimeError(
+            "Missing final PPO update diagnostics."
+        )
+
+
+    expected_optimizer_samples = (
+        UPDATE_SIZE
+        * (
+            int(
+                INCLUDE_ORIGINAL_SAMPLE
+            )
+            + NUM_CANDIDATE_PERMUTATIONS
+        )
+    )
+
+    if (
+        last_update.num_optimizer_samples
+        != expected_optimizer_samples
+    ):
+        raise RuntimeError(
+            "Candidate augmentation produced the "
+            "wrong PPO optimizer sample count."
+        )
+
+
+    if (
+        last_update.expert_update
+        is None
+    ):
+        raise RuntimeError(
+            "Expected a PF-expert/JSD update."
         )
 
 
