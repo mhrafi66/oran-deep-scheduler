@@ -35,6 +35,7 @@ from oran_scheduler.rl.ppo_training_runner import (
 )
 from oran_scheduler.rl.ppo_traffic_cell_step import (
     PPOTrafficRewardPopulation,
+    TrafficAwarePPOCellTTIStepResult,
     prepare_traffic_aware_ppo_cell_tti,
     run_traffic_aware_ppo_cell_tti_step,
 )
@@ -61,6 +62,15 @@ PPOMultiCellTrainingTTIInputProvider = Callable[
         int,
     ],
     PPOTrainingTTIInputs,
+]
+
+PPOMultiCellResultObserver = Callable[
+    [
+        int,
+        int,
+        TrafficAwarePPOCellTTIStepResult,
+    ],
+    None,
 ]
 
 
@@ -151,6 +161,9 @@ def run_multicell_ppo_training(
     reward_reduction: (
         PPORewardReduction
     ) = "mean",
+    cell_result_observer: (
+        PPOMultiCellResultObserver | None
+    ) = None,
     device: str | torch.device = "cuda:0",
 ) -> PPOMultiCellTrainingRunResult:
     """
@@ -541,6 +554,13 @@ def run_multicell_ppo_training(
                 cell_result
                 .num_expert_demonstrations_added
             )
+
+            if cell_result_observer is not None:
+                cell_result_observer(
+                    tti_index,
+                    cell_index,
+                    cell_result,
+                )
 
     updates_after = (
         centralized_training.num_updates

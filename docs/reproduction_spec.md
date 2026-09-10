@@ -52,6 +52,54 @@ The goal of this project is instead to reproduce, as faithfully as possible:
 After reproduction, the implementation will be used for controlled
 stress testing.
 
+### PPO sample granularity: 84 vs. 1512 samples/TTI
+
+The v3 paper contains an internal ambiguity in the definition of a
+PPO training sample.
+
+The 1LDS architecture performs one neural-network inference per
+MU-MIMO user layer. The actor produces an action vector containing
+one categorical action for every RBG:
+
+    a = [a_1, ..., a_N_RBG]
+
+and the PPO policy probability is defined as the product of the
+individual RBG branch probabilities. Algorithm 1 likewise stores one
+(state, action, reward, log-probability) item per user layer.
+
+Therefore the primary reproduction treats one temporal PPO
+transition as one complete joint all-RBG decision for one user layer.
+
+For the training configuration:
+
+    21 cells x 4 user layers = 84 joint PPO transitions / TTI.
+
+Separately, the paper states that:
+
+    21 cells x 4 user layers x 18 RBGs
+        = 1512 samples / TTI.
+
+We interpret this second number as the number of RBG-level scheduling
+decision components contained within the 84 joint transitions:
+
+    84 joint transitions x 18 RBG branches
+        = 1512 RBG decision/sample equivalents.
+
+This interpretation preserves the paper's reported sample-count
+arithmetic (~450k RBG-level samples by TTI 400) without changing the
+joint 1LDS PPO action and probability formulation.
+
+This distinction is PAPER-AMBIGUOUS / OPEN-REPRODUCTION and should be
+reported explicitly in experiments.
+
+For PPO, M=128 is interpreted as the update threshold in joint
+layer-level transitions. In synchronized multi-cell training, the
+number of available transitions may cross M without equaling it
+exactly. The primary reproduction therefore consumes the complete
+current on-policy batch when the threshold is reached
+(`use_all_when_reached`). This centralized batching rule is an
+OPEN-REPRODUCTION choice.
+
 ---
 
 ## 3. Reproducibility Labels

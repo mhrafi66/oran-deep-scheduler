@@ -124,6 +124,22 @@ class ChunkedSionnaPPOConfig:
 
     device: str = "cuda:0"
 
+    # ----------------------------------------------------------
+    # TOPOLOGY / STATIC STRESS PARAMETERS
+    #
+    # Defaults reproduce the paper configuration.
+    # ----------------------------------------------------------
+
+    scenario: str = "uma"
+
+    isd_m: float = 200.0
+
+    bs_height_m: float = 25.0
+
+    ut_height_m: float = 1.5
+
+    ut_speed_kmh: float = 3.0
+
 
     def __post_init__(
         self,
@@ -156,6 +172,33 @@ class ChunkedSionnaPPOConfig:
             raise ValueError(
                 "ue_microbatch_size must be positive."
             )
+
+
+        if not self.scenario:
+            raise ValueError(
+                "scenario cannot be empty."
+            )
+
+        if self.isd_m <= 0.0:
+            raise ValueError(
+                "isd_m must be positive."
+            )
+
+        if self.bs_height_m <= 0.0:
+            raise ValueError(
+                "bs_height_m must be positive."
+            )
+
+        if self.ut_height_m <= 0.0:
+            raise ValueError(
+                "ut_height_m must be positive."
+            )
+
+        if self.ut_speed_kmh < 0.0:
+            raise ValueError(
+                "ut_speed_kmh cannot be negative."
+            )
+
 
 
 @dataclass(frozen=True)

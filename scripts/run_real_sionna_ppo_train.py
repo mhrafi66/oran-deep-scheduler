@@ -96,17 +96,17 @@ from oran_scheduler.rl.ppo_checkpoint import (
 
 METRICS_PATH = Path(
     "experiments/"
-    "kingspeak_2cell_10tti_ppo_metrics.csv"
+    "notchpeak_21cell_ppo_training_metrics.csv"
 )
 
 KPI_METRICS_PATH = Path(
     "experiments/"
-    "real_sionna_ppo_kpi_metrics.csv"
+    "notchpeak_21cell_ppo_kpi_metrics.csv"
 )
 
 CHECKPOINT_PATH = Path(
     "experiments/checkpoints/"
-    "ppo_1lds_reference.pt"
+    "ppo_1lds_notchpeak_latest.pt"
 )
 
 DEVICE = torch.device(
@@ -125,14 +125,14 @@ NUM_USER_SLOTS = 4
 
 
 # # PAPER-SPECIFIED full centralized training network.
-# NUM_TRAINING_CELLS = 21
+# NUM_TRAINING_CELLS = 211
 
 # TEMPORARY KINGSPEAK DEVELOPMENT CONFIG.
 #
 # OPEN-REPRODUCTION ENGINEERING:
 # Execute only two PPO cell streams while retaining
 # the complete 420-UE / 21-cell global topology.
-NUM_TRAINING_CELLS = 2
+NUM_TRAINING_CELLS = 21
 
 #
 # OPEN-REPRODUCTION ENGINEERING.
@@ -140,13 +140,13 @@ NUM_TRAINING_CELLS = 2
 # Maximum number of serving UEs passed to one
 # paper-array Sionna generation call.
 #
-UE_MICROBATCH_SIZE = 2
+UE_MICROBATCH_SIZE = 4
 
 
 # Scalability probe only:
 #
 # advance exactly one paper-sized warm-up TTI.
-NUM_TTIS = 10
+NUM_TTIS = 1000
 
 
 # --------------------------------------------------------------
@@ -181,7 +181,7 @@ NUM_TTIS = 10
 # first cross-TTI update boundary.
 #
 # Paper uses M = 128.
-UPDATE_SIZE = 8
+UPDATE_SIZE = 128
 
 # --------------------------------------------------------------
 # OPEN-REPRODUCTION PARAMETERS.
@@ -1850,6 +1850,72 @@ def main() -> None:
             )
 
 
+        # --------------------------------------------------
+        # DURABLE PER-TTI MODEL CHECKPOINT
+        #
+        # Save to a temporary file first, then atomically
+        # replace the latest checkpoint. Therefore a Slurm
+        # timeout during a later TTI cannot destroy the last
+        # successfully completed checkpoint.
+        #
+        # NOTE:
+        # This preserves model/optimizer state only.
+        # It is NOT an exact simulator-state resume point.
+        # --------------------------------------------------
+
+        temporary_checkpoint_path = (
+            CHECKPOINT_PATH.with_name(
+                CHECKPOINT_PATH.stem
+                + ".tmp"
+                + CHECKPOINT_PATH.suffix
+            )
+        )
+
+        save_ppo_model_checkpoint(
+            path=temporary_checkpoint_path,
+            actor=actor,
+            critic=critic,
+            optimizers=optimizers,
+            tti_index=tti_index,
+            num_ppo_updates=(
+                centralized_training.num_updates
+            ),
+            metadata={
+                "num_training_cells": (
+                    NUM_TRAINING_CELLS
+                ),
+                "num_user_slots": (
+                    NUM_USER_SLOTS
+                ),
+                "num_rbgs": NUM_RBGS,
+                "update_size": UPDATE_SIZE,
+                "first_collection_tti": (
+                    FIRST_COLLECTION_TTI_INDEX
+                ),
+                "ue_microbatch_size": (
+                    UE_MICROBATCH_SIZE
+                ),
+                "run_type": (
+                    "accelerated_full_scale_training"
+                ),
+                "sample_semantics": (
+                    "one joint PPO transition per "
+                    "cell/user-layer; 18 RBG branches "
+                    "per transition"
+                ),
+            },
+        )
+
+        temporary_checkpoint_path.replace(
+            CHECKPOINT_PATH
+        )
+
+        print(
+            "  latest checkpoint:     "
+            f"{CHECKPOINT_PATH}"
+        )
+
+
     total_elapsed = (
         time.perf_counter()
         - total_start
@@ -2066,123 +2132,11 @@ def main() -> None:
 
 
     # ==============================================================
-    # TEST-SCALE REPEATED-LEARNING VALIDATION
+    # FULL-SCALE TRAINING
     #
-    # OPEN-REPRODUCTION INTEGRATION RUN:
-    #
-    #   2 streams
-    #   4 1LDS user slots / stream
-    #   update size = 8
-    #   experience collection starts at TTI 0
-    #
-    # TTI 0 establishes the first cross-TTI boundary.
-    # Every following TTI resolves that boundary, reaches
-    # exactly one centralized batch of 8 transitions, and
-    # triggers one PPO + one PF-expert/JSD update.
+    # The old 2-cell/M=8 repeated-learning assertions
+    # are intentionally omitted here.
     # ==============================================================
-
-    expected_num_updates = (
-        NUM_TTIS - 1
-    )
-
-    if (
-        centralized_training.num_updates
-        != expected_num_updates
-    ):
-        raise RuntimeError(
-            "Unexpected number of centralized PPO updates: "
-            f"expected {expected_num_updates}, got "
-            f"{centralized_training.num_updates}."
-        )
-
-
-    if (
-        centralized_training
-        .num_expert_guidance_updates
-        != expected_num_updates
-    ):
-        raise RuntimeError(
-            "Unexpected number of PF-expert/JSD updates: "
-            f"expected {expected_num_updates}, got "
-            f"{centralized_training.num_expert_guidance_updates}."
-        )
-
-
-    if len(
-        expert_buffer
-    ) == 0:
-        raise RuntimeError(
-            "PF expert did not populate D_expert."
-        )
-
-
-    last_update = (
-        centralized_training.last_update
-    )
-
-    if last_update is None:
-        raise RuntimeError(
-            "Missing final PPO update diagnostics."
-        )
-
-
-    expected_optimizer_samples = (
-        UPDATE_SIZE
-        * (
-            int(
-                INCLUDE_ORIGINAL_SAMPLE
-            )
-            + NUM_CANDIDATE_PERMUTATIONS
-        )
-    )
-
-    if (
-        last_update.num_optimizer_samples
-        != expected_optimizer_samples
-    ):
-        raise RuntimeError(
-            "Candidate augmentation produced the "
-            "wrong PPO optimizer sample count."
-        )
-
-
-    if (
-        last_update.expert_update
-        is None
-    ):
-        raise RuntimeError(
-            "Expected a PF-expert/JSD update."
-        )
-
-
-    expected_final_buffer_size = (
-        NUM_TRAINING_CELLS
-        * (
-            NUM_USER_SLOTS - 1
-        )
-    )
-
-    if (
-        len(transition_buffer)
-        != expected_final_buffer_size
-    ):
-        raise RuntimeError(
-            "Unexpected final on-policy buffer size: "
-            f"expected {expected_final_buffer_size}, got "
-            f"{len(transition_buffer)}."
-        )
-
-
-    if not all(
-        controller.has_unresolved_tti_boundary
-        for controller in rollout_controllers
-    ):
-        raise RuntimeError(
-            "Expected each stream to retain its final "
-            "cross-TTI boundary after the short run."
-        )
-
-
 
     # ==============================================================
     # TEST-SCALE REAL-LEARNING VALIDATION
