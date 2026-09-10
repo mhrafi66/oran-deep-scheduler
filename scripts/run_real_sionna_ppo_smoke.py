@@ -4,6 +4,9 @@ import time
 
 import torch
 
+import csv
+from pathlib import Path
+
 from oran_scheduler.rl.ppo_actor import (
     OneLDSPPOActor,
     OneLDSPPOActorConfig,
@@ -83,6 +86,11 @@ from oran_scheduler.rl.ppo_pf_expert import (
     PPOPFExpertConfig,
 )
 
+METRICS_PATH = Path(
+    "experiments/"
+    "kingspeak_2cell_10tti_ppo_metrics.csv"
+)
+
 DEVICE = torch.device(
     "cuda:0"
 )
@@ -120,7 +128,7 @@ UE_MICROBATCH_SIZE = 2
 # Scalability probe only:
 #
 # advance exactly one paper-sized warm-up TTI.
-NUM_TTIS = 2
+NUM_TTIS = 10
 
 
 # --------------------------------------------------------------
@@ -548,8 +556,7 @@ def main() -> None:
     )
 
     print(
-        "Expert guidance:        configured, "
-        "inactive during warm-up"
+        "Expert guidance:        enabled during collection"
     )
 
     print(
@@ -570,18 +577,21 @@ def main() -> None:
     # )
 
     print(
-        "Permutation:            configured, "
-        "inactive during warm-up"
+        "Permutation:            enabled at PPO update"
     )
-
     print(
         "Collection starts TTI:  "
         f"{FIRST_COLLECTION_TTI_INDEX}"
     )
 
+    # print(
+    #     "Run type:               "
+    #     "21-cell warm-up scalability"
+    # )
+
     print(
         "Run type:               "
-        "21-cell warm-up scalability"
+        "2-cell real-Sionna repeated-learning run"
     )
 
     print(
@@ -1224,6 +1234,43 @@ def main() -> None:
         time.perf_counter()
     )
 
+    METRICS_PATH.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    metrics_fieldnames = [
+        "tti",
+        "elapsed_s",
+        "peak_gpu_mib",
+        "buffer_size",
+        "ppo_updates_this_tti",
+        "total_ppo_updates",
+        "expert_demos_added",
+        "expert_buffer_size",
+        "jsd_updates_this_tti",
+        "mean_td_rate_mbps",
+        "mean_wideband_cqi",
+        "actor_norm",
+        "critic_norm",
+        "actor_loss",
+        "critic_loss",
+        "mean_ppo_ratio",
+        "mean_advantage",
+        "raw_jsd_loss",
+        "weighted_jsd_loss",
+    ]
+
+    with METRICS_PATH.open(
+        "w",
+        newline="",
+    ) as metrics_file:
+        writer = csv.DictWriter(
+            metrics_file,
+            fieldnames=metrics_fieldnames,
+        )
+        writer.writeheader()
+
     for tti_index in range(
         NUM_TTIS
     ):
@@ -1545,6 +1592,15 @@ def main() -> None:
             f"{mean_wideband_cqi:.3f}"
         )
 
+
+        actor_loss_value = None
+        critic_loss_value = None
+        mean_ppo_ratio_value = None
+        mean_advantage_value = None
+        raw_jsd_loss_value = None
+        weighted_jsd_loss_value = None
+
+
         if (
             updates_after
             > updates_before
@@ -1559,6 +1615,37 @@ def main() -> None:
                     "PPO update occurred without "
                     "stored diagnostics."
                 )
+
+
+            actor_loss_value = float(
+                update
+                .ppo_update
+                .actor_loss
+                .item()
+            )
+
+            critic_loss_value = float(
+                update
+                .ppo_update
+                .critic_loss
+                .item()
+            )
+
+            mean_ppo_ratio_value = float(
+                update
+                .ppo_update
+                .mean_probability_ratio
+                .item()
+            )
+
+            mean_advantage_value = float(
+                update
+                .ppo_update
+                .mean_advantage
+                .item()
+            )
+
+
 
             print()
 
@@ -1613,6 +1700,14 @@ def main() -> None:
                 .loss_data
             )
 
+            raw_jsd_loss_value = float(
+                expert_loss.raw_loss.item()
+            )
+
+            weighted_jsd_loss_value = float(
+                expert_loss.weighted_loss.item()
+            )
+
             print()
 
             print(
@@ -1627,9 +1722,83 @@ def main() -> None:
             print(
                 "      weighted JSD loss:  "
                 f"{float(expert_loss.weighted_loss.item()): .6f}"
-            )
-
+            )   
         print()
+        current_actor_norm = module_parameter_norm(
+            actor
+        )
+
+        current_critic_norm = module_parameter_norm(
+            critic
+        )
+
+
+        metrics_row = {
+            "tti": tti_index,
+            "elapsed_s": elapsed,
+            "peak_gpu_mib": peak_memory_mib,
+            "buffer_size": (
+                result.final_transition_buffer_size
+            ),
+            "ppo_updates_this_tti": (
+                updates_after - updates_before
+            ),
+            "total_ppo_updates": updates_after,
+            "expert_demos_added": (
+                len(expert_buffer)
+                - expert_buffer_before
+            ),
+            "expert_buffer_size": len(
+                expert_buffer
+            ),
+            "jsd_updates_this_tti": (
+                expert_updates_after
+                - expert_updates_before
+            ),
+            "mean_td_rate_mbps": (
+                mean_td_rate_mbps
+            ),
+            "mean_wideband_cqi": (
+                mean_wideband_cqi
+            ),
+            "actor_norm": (
+                current_actor_norm
+            ),
+            "critic_norm": (
+                current_critic_norm
+            ),
+            "actor_loss": (
+                actor_loss_value
+            ),
+            "critic_loss": (
+                critic_loss_value
+            ),
+            "mean_ppo_ratio": (
+                mean_ppo_ratio_value
+            ),
+            "mean_advantage": (
+                mean_advantage_value
+            ),
+            "raw_jsd_loss": (
+                raw_jsd_loss_value
+            ),
+            "weighted_jsd_loss": (
+                weighted_jsd_loss_value
+            ),
+        }
+
+
+        with METRICS_PATH.open(
+            "a",
+            newline="",
+        ) as metrics_file:
+            writer = csv.DictWriter(
+                metrics_file,
+                fieldnames=metrics_fieldnames,
+            )
+            writer.writerow(
+                metrics_row
+            )
 
 
     total_elapsed = (
@@ -1845,42 +2014,48 @@ def main() -> None:
     #         "pre-collection warm-up."
     #     )
 
+
+
     # ==============================================================
-    # TEST-SCALE REAL-LEARNING VALIDATION
+    # TEST-SCALE REPEATED-LEARNING VALIDATION
     #
-    # OPEN-REPRODUCTION INTEGRATION TEST:
+    # OPEN-REPRODUCTION INTEGRATION RUN:
     #
-    #   2 centralized streams
+    #   2 streams
     #   4 1LDS user slots / stream
-    #   collection from TTI 0
-    #   update_size = 8
+    #   update size = 8
+    #   experience collection starts at TTI 0
     #
-    # TTI 0 produces the within-TTI transitions.
-    # At the start of TTI 1, the cross-TTI boundaries are
-    # resolved and the centralized buffer reaches 8.
-    #
-    # We therefore expect exactly one PPO update and one
-    # PF-expert/JSD update.
+    # TTI 0 establishes the first cross-TTI boundary.
+    # Every following TTI resolves that boundary, reaches
+    # exactly one centralized batch of 8 transitions, and
+    # triggers one PPO + one PF-expert/JSD update.
     # ==============================================================
+
+    expected_num_updates = (
+        NUM_TTIS - 1
+    )
 
     if (
         centralized_training.num_updates
-        != 1
+        != expected_num_updates
     ):
         raise RuntimeError(
-            "Expected exactly one centralized PPO "
-            "update in the two-TTI learning smoke."
+            "Unexpected number of centralized PPO updates: "
+            f"expected {expected_num_updates}, got "
+            f"{centralized_training.num_updates}."
         )
 
 
     if (
         centralized_training
         .num_expert_guidance_updates
-        != 1
+        != expected_num_updates
     ):
         raise RuntimeError(
-            "Expected exactly one PF-expert/JSD "
-            "update in the two-TTI learning smoke."
+            "Unexpected number of PF-expert/JSD updates: "
+            f"expected {expected_num_updates}, got "
+            f"{centralized_training.num_expert_guidance_updates}."
         )
 
 
@@ -1929,6 +2104,121 @@ def main() -> None:
         raise RuntimeError(
             "Expected a PF-expert/JSD update."
         )
+
+
+    expected_final_buffer_size = (
+        NUM_TRAINING_CELLS
+        * (
+            NUM_USER_SLOTS - 1
+        )
+    )
+
+    if (
+        len(transition_buffer)
+        != expected_final_buffer_size
+    ):
+        raise RuntimeError(
+            "Unexpected final on-policy buffer size: "
+            f"expected {expected_final_buffer_size}, got "
+            f"{len(transition_buffer)}."
+        )
+
+
+    if not all(
+        controller.has_unresolved_tti_boundary
+        for controller in rollout_controllers
+    ):
+        raise RuntimeError(
+            "Expected each stream to retain its final "
+            "cross-TTI boundary after the short run."
+        )
+
+
+
+    # ==============================================================
+    # TEST-SCALE REAL-LEARNING VALIDATION
+    #
+    # OPEN-REPRODUCTION INTEGRATION TEST:
+    #
+    #   2 centralized streams
+    #   4 1LDS user slots / stream
+    #   collection from TTI 0
+    #   update_size = 8
+    #
+    # TTI 0 produces the within-TTI transitions.
+    # At the start of TTI 1, the cross-TTI boundaries are
+    # resolved and the centralized buffer reaches 8.
+    #
+    # We therefore expect exactly one PPO update and one
+    # PF-expert/JSD update.
+    # ==============================================================
+
+    # if (
+    #     centralized_training.num_updates
+    #     != 1
+    # ):
+    #     raise RuntimeError(
+    #         "Expected exactly one centralized PPO "
+    #         "update in the two-TTI learning smoke."
+    #     )
+
+
+    # if (
+    #     centralized_training
+    #     .num_expert_guidance_updates
+    #     != 1
+    # ):
+    #     raise RuntimeError(
+    #         "Expected exactly one PF-expert/JSD "
+    #         "update in the two-TTI learning smoke."
+    #     )
+
+
+    # if len(
+    #     expert_buffer
+    # ) == 0:
+    #     raise RuntimeError(
+    #         "PF expert did not populate D_expert."
+    #     )
+
+
+    # last_update = (
+    #     centralized_training.last_update
+    # )
+
+    # if last_update is None:
+    #     raise RuntimeError(
+    #         "Missing final PPO update diagnostics."
+    #     )
+
+
+    # expected_optimizer_samples = (
+    #     UPDATE_SIZE
+    #     * (
+    #         int(
+    #             INCLUDE_ORIGINAL_SAMPLE
+    #         )
+    #         + NUM_CANDIDATE_PERMUTATIONS
+    #     )
+    # )
+
+    # if (
+    #     last_update.num_optimizer_samples
+    #     != expected_optimizer_samples
+    # ):
+    #     raise RuntimeError(
+    #         "Candidate augmentation produced the "
+    #         "wrong PPO optimizer sample count."
+    #     )
+
+
+    # if (
+    #     last_update.expert_update
+    #     is None
+    # ):
+    #     raise RuntimeError(
+    #         "Expected a PF-expert/JSD update."
+    #     )
 
 
     if not torch.isfinite(
@@ -2013,19 +2303,34 @@ def main() -> None:
         f"{FIRST_COLLECTION_TTI_INDEX}"
     )
 
+    # print(
+    #     "Warm-up PPO updates:     "
+    #     f"{centralized_training.num_updates}"
+    # )
+
     print(
-        "Warm-up PPO updates:     "
+        "Total PPO updates:       "
         f"{centralized_training.num_updates}"
     )
 
+    # print(
+    #     "Warm-up expert updates:  "
+    #     f"{centralized_training.num_expert_guidance_updates}"
+    # )
+
     print(
-        "Warm-up expert updates:  "
+        "Total expert updates:    "
         f"{centralized_training.num_expert_guidance_updates}"
     )
 
     print(
         "Chunked TTI builds:      "
         f"{radio_input_provider.num_tti_builds}"
+    )
+
+    print(
+        "Metrics CSV:             "
+        f"{METRICS_PATH}"
     )
 
     print("=" * 72)
