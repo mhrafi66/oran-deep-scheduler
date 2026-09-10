@@ -140,6 +140,257 @@ def generate_topology(
         grid= grid
     )
 
+def subset_topology_ues(
+    *,
+    topology: TopologyData,
+    global_ue_indices: torch.Tensor,
+) -> TopologyData:
+    """
+    Build a UE-subset view of an existing topology
+    while preserving every BS.
+
+    This is used by the memory-safe paper-MIMO path.
+
+    Example:
+
+        full topology:
+            420 UEs
+            21 BSs
+
+        selected cell:
+            global UE IDs
+            [17, 52, 84, ...]
+
+        returned topology:
+            only those UEs
+            ALL 21 BSs
+
+    Therefore channel generation becomes:
+
+        [local UE, all 21 BS]
+
+    rather than:
+
+        [all 420 UE, all 21 BS]
+
+    Scheduler/global UE identity is NOT changed by
+    this function.
+
+    OPEN-REPRODUCTION ENGINEERING:
+        This is a memory implementation detail, not
+        part of the Bell Labs scheduling algorithm.
+    """
+
+    if global_ue_indices.ndim != 1:
+        raise ValueError(
+            "global_ue_indices must have shape [UE]."
+        )
+
+    if (
+        global_ue_indices.dtype
+        == torch.bool
+        or torch.is_floating_point(
+            global_ue_indices
+        )
+    ):
+        raise ValueError(
+            "global_ue_indices must use an integer dtype."
+        )
+
+    num_global_ues = int(
+        topology.ut_loc.shape[1]
+    )
+
+    if global_ue_indices.numel() == 0:
+        raise ValueError(
+            "A topology UE subset cannot be empty."
+        )
+
+    if torch.any(
+        global_ue_indices < 0
+    ):
+        raise ValueError(
+            "global_ue_indices cannot be negative."
+        )
+
+    if torch.any(
+        global_ue_indices >= num_global_ues
+    ):
+        raise ValueError(
+            "A requested UE index is outside the "
+            "full topology."
+        )
+
+    if (
+        torch.unique(
+            global_ue_indices
+        ).numel()
+        != global_ue_indices.numel()
+    ):
+        raise ValueError(
+            "global_ue_indices must be unique."
+        )
+
+    indices = global_ue_indices.to(
+        device=topology.ut_loc.device,
+        dtype=torch.long,
+    )
+
+    # ----------------------------------------------------------
+    # UE-indexed tensors:
+    #     [batch, UE, ...]
+    # ----------------------------------------------------------
+
+    ut_loc = topology.ut_loc.index_select(
+        1,
+        indices,
+    )
+
+    ut_orientations = (
+        topology
+        .ut_orientations
+        .index_select(
+            1,
+            indices,
+        )
+    )
+
+    ut_velocities = (
+        topology
+        .ut_velocities
+        .index_select(
+            1,
+            indices,
+        )
+    )
+
+    # ----------------------------------------------------------
+    # Indoor/outdoor state.
+    #
+    # Sionna's generated topology currently exposes
+    # this in UE order.
+    # ----------------------------------------------------------
+
+    if (
+        topology.in_state.ndim < 2
+        or topology.in_state.shape[1]
+        != num_global_ues
+    ):
+        raise ValueError(
+            "Unexpected in_state topology shape."
+        )
+
+    in_state = (
+        topology
+        .in_state
+        .index_select(
+            1,
+            indices,
+        )
+    )
+
+    # ----------------------------------------------------------
+    # Optional explicit LOS state.
+    #
+    # Depending on Sionna topology representation,
+    # this may be absent.
+    #
+    # Expected multicell form when present:
+    #     [batch, BS, UE]
+    # ----------------------------------------------------------
+
+    if topology.los is None:
+        los = None
+
+    else:
+        if (
+            topology.los.ndim >= 3
+            and topology.los.shape[2]
+            == num_global_ues
+        ):
+            los = (
+                topology
+                .los
+                .index_select(
+                    2,
+                    indices,
+                )
+            )
+
+        elif (
+            topology.los.ndim >= 2
+            and topology.los.shape[1]
+            == num_global_ues
+        ):
+            los = (
+                topology
+                .los
+                .index_select(
+                    1,
+                    indices,
+                )
+            )
+
+        else:
+            raise ValueError(
+                "Unexpected LOS topology shape."
+            )
+
+    # ----------------------------------------------------------
+    # Virtual BS locations:
+    #
+    #     [batch, BS, UE, xyz]
+    #
+    # Keep ALL BSs; subset only the UE axis.
+    # ----------------------------------------------------------
+
+    if (
+        topology.bs_virtual_loc.ndim != 4
+        or topology.bs_virtual_loc.shape[2]
+        != num_global_ues
+    ):
+        raise ValueError(
+            "Unexpected bs_virtual_loc topology shape."
+        )
+
+    bs_virtual_loc = (
+        topology
+        .bs_virtual_loc
+        .index_select(
+            2,
+            indices,
+        )
+    )
+
+    return TopologyData(
+        ut_loc=ut_loc,
+
+        # BS tensors remain unchanged.
+        bs_loc=topology.bs_loc,
+
+        ut_orientations=(
+            ut_orientations
+        ),
+
+        bs_orientations=(
+            topology.bs_orientations
+        ),
+
+        ut_velocities=(
+            ut_velocities
+        ),
+
+        in_state=in_state,
+
+        los=los,
+
+        bs_virtual_loc=(
+            bs_virtual_loc
+        ),
+
+        grid=topology.grid,
+    )
+
 
 def validate_evaluation_topology(
         topology: TopologyData,

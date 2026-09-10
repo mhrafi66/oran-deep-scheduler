@@ -71,6 +71,20 @@ class PPOPhysicalScoreInputs:
 
     rate_config: RateConfig
 
+    #
+    # OPEN-REPRODUCTION ENGINEERING MECHANISM.
+    #
+    # None:
+    #     global UE ID == h_freq UE-axis position
+    #
+    # Chunked PHY:
+    #     global identity and local PHY storage
+    #     position may differ.
+    #
+    candidate_physical_ue_indices: (
+        torch.Tensor | None
+    ) = None
+
     batch_index: int = 0
 
 
@@ -99,6 +113,58 @@ class CachedPPOPhysicalRBGScorer:
                 "candidate_global_ue_indices must "
                 "have shape [candidate]."
             )
+
+        physical_indices = (
+            inputs
+            .candidate_physical_ue_indices
+        )
+
+        if physical_indices is not None:
+            if physical_indices.ndim != 1:
+                raise ValueError(
+                    "candidate_physical_ue_indices "
+                    "must have shape [candidate]."
+                )
+
+            if tuple(
+                physical_indices.shape
+            ) != tuple(
+                inputs
+                .candidate_global_ue_indices
+                .shape
+            ):
+                raise ValueError(
+                    "Global and physical candidate "
+                    "UE mappings must have the same "
+                    "shape."
+                )
+
+            if (
+                physical_indices.device
+                != inputs.h_freq.device
+            ):
+                raise ValueError(
+                    "candidate_physical_ue_indices "
+                    "and h_freq must be on the same "
+                    "device."
+                )
+
+            if torch.is_floating_point(
+                physical_indices
+            ):
+                raise ValueError(
+                    "candidate_physical_ue_indices "
+                    "must use an integer dtype."
+                )
+
+            if (
+                physical_indices.dtype
+                == torch.bool
+            ):
+                raise ValueError(
+                    "candidate_physical_ue_indices "
+                    "cannot use torch.bool."
+                )
 
         if inputs.subcarriers_per_rbg <= 0:
             raise ValueError(
@@ -201,6 +267,11 @@ class CachedPPOPhysicalRBGScorer:
                 candidate_global_ue_indices=(
                     self.inputs
                     .candidate_global_ue_indices
+                ),
+
+                candidate_physical_ue_indices=(
+                    self.inputs
+                    .candidate_physical_ue_indices
                 ),
                 h_freq=(
                     self.inputs
