@@ -1477,6 +1477,16 @@ def main() -> None:
             f"{radio_input_provider.num_stream_builds}"
         )
 
+        print(
+            "Channel generations:     "
+            f"{radio_input_provider.num_channel_generations}"
+        )
+
+        print(
+            "Channel topology resets: "
+            f"{radio_input_provider.num_channel_topology_resets}"
+        )
+
         current_observations = (
             radio_input_provider
             .current_observations

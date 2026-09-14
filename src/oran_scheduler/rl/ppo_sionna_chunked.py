@@ -39,6 +39,7 @@ from oran_scheduler.simulator.cell_association import (
 )
 from oran_scheduler.simulator.channel import (
     ChannelConfig,
+    FrequencyChannelRuntime,
     generate_frequency_channel,
 )
 from oran_scheduler.simulator.one_lds_cell_tti import (
@@ -242,6 +243,18 @@ class ChunkedSionnaPPOContext:
     link_adaptation_config: LinkAdaptationConfig
 
     rate_config: RateConfig
+
+    #
+    # PERFORMANCE ENGINEERING.
+    #
+    # One persistent paper-array Sionna runtime is
+    # shared by every serving cell / UE microbatch.
+    #
+    # This changes object lifetime only. The channel
+    # topology and deterministic per-microbatch seed
+    # are still supplied for every generation.
+    #
+    channel_runtime: FrequencyChannelRuntime
 
 
     @property
@@ -569,6 +582,67 @@ def build_chunked_sionna_ppo_context(
         device=config.device,
     )
 
+    # ==========================================================
+    # PERSISTENT PAPER-MIMO SIONNA RUNTIME
+    # ==========================================================
+    #
+    # Previously every UE microbatch recreated:
+    #
+    #     PanelArray
+    #     ResourceGrid
+    #     UMa
+    #     GenerateOFDMChannel
+    #
+    # The runtime now creates those objects once.
+    #
+    # Per-microbatch topology and seed are still
+    # supplied independently below.
+    #
+
+    paper_channel_config = ChannelConfig(
+        carrier_frequency_hz=4.0e9,
+
+        subcarrier_spacing_hz=30.0e3,
+
+        num_rbs=(
+            config.num_rbs
+        ),
+
+        subcarriers_per_rb=(
+            config.subcarriers_per_rb
+        ),
+
+        num_ofdm_symbols=1,
+
+        antenna_mode="paper",
+
+        direction="downlink",
+
+        o2i_model="low",
+
+        enable_pathloss=True,
+
+        enable_shadow_fading=True,
+
+        precision="single",
+
+        device=config.device,
+
+        #
+        # The actual realization seed is supplied
+        # separately to runtime.generate().
+        #
+        seed=config.mimo_channel_seed,
+    )
+
+    channel_runtime = (
+        FrequencyChannelRuntime(
+            config=(
+                paper_channel_config
+            )
+        )
+    )
+
     return ChunkedSionnaPPOContext(
         config=config,
 
@@ -601,6 +675,10 @@ def build_chunked_sionna_ppo_context(
         ),
 
         rate_config=rate_config,
+
+        channel_runtime=(
+            channel_runtime
+        ),
     )
 
 
@@ -2333,54 +2411,89 @@ def _build_cell_training_inputs(
             )
         )
 
-        channel_config = ChannelConfig(
-            carrier_frequency_hz=4.0e9,
+        # channel_config = ChannelConfig(
+        #     carrier_frequency_hz=4.0e9,
 
-            subcarrier_spacing_hz=30.0e3,
+        #     subcarrier_spacing_hz=30.0e3,
 
-            num_rbs=(
-                context.config.num_rbs
-            ),
+        #     num_rbs=(
+        #         context.config.num_rbs
+        #     ),
 
-            subcarriers_per_rb=(
-                context
-                .config
-                .subcarriers_per_rb
-            ),
+        #     subcarriers_per_rb=(
+        #         context
+        #         .config
+        #         .subcarriers_per_rb
+        #     ),
 
-            num_ofdm_symbols=1,
+        #     num_ofdm_symbols=1,
 
-            antenna_mode="paper",
+        #     antenna_mode="paper",
 
-            direction="downlink",
+        #     direction="downlink",
 
-            o2i_model="low",
+        #     o2i_model="low",
 
-            enable_pathloss=True,
+        #     enable_pathloss=True,
 
-            enable_shadow_fading=True,
+        #     enable_shadow_fading=True,
 
-            precision="single",
+        #     precision="single",
 
-            device=(
-                context.config.device
-            ),
+        #     device=(
+        #         context.config.device
+        #     ),
 
-            seed=channel_seed,
-        )
+        #     seed=channel_seed,
+        # )
+
+        # channel = (
+        #     generate_frequency_channel(
+        #         topology=(
+        #             microbatch_topology
+        #         ),
+
+        #         topology_config=(
+        #             context.topology_config
+        #         ),
+
+        #         channel_config=(
+        #             channel_config
+        #         ),
+        #     )
+        # )
+
+        # ======================================================
+        # PERSISTENT SIONNA RADIO GENERATION
+        # ======================================================
+        #
+        # The topology and RNG seed remain unique to
+        # this exact:
+        #
+        #     TTI
+        #     real cell
+        #     UE microbatch
+        #
+        # but the expensive configuration-invariant
+        # Sionna objects are reused.
+        #
 
         channel = (
-            generate_frequency_channel(
+            context
+            .channel_runtime
+            .generate(
                 topology=(
                     microbatch_topology
                 ),
 
-                topology_config=(
-                    context.topology_config
+                seed=(
+                    channel_seed
                 ),
 
-                channel_config=(
-                    channel_config
+                batch_size=(
+                    context
+                    .topology_config
+                    .batch_size
                 ),
             )
         )
@@ -2947,6 +3060,27 @@ class CellChunkedSionnaPPOInputProvider:
     ) -> int:
         return (
             self._num_stream_builds
+        )
+
+    @property
+    def num_channel_generations(
+        self,
+    ) -> int:
+        return (
+            self.context
+            .channel_runtime
+            .num_generations
+        )
+
+
+    @property
+    def num_channel_topology_resets(
+        self,
+    ) -> int:
+        return (
+            self.context
+            .channel_runtime
+            .num_topology_resets
         )
 
 
