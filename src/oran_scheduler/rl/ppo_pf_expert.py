@@ -320,6 +320,332 @@ def _validate_pf_expert_inputs(
         )
 
 
+def _generate_ppo_pf_expert_actions_batched(
+    *,
+    allocation: CellAllocation,
+    user_slot_index: int,
+    num_candidates: int,
+    past_average_throughput: torch.Tensor,
+    action_mask: torch.Tensor,
+    score_many_pf,
+    config: PPOPFExpertConfig,
+) -> PPOPFExpertActionData:
+    """
+    GPU-batched PF expert.
+
+    Physics is identical to the scalar expert.
+
+    Difference:
+
+        scalar:
+            RBG -> action -> PHY
+
+        batched:
+            construct all legal hypotheses
+                    ->
+            batched PHY
+                    ->
+            choose expert actions
+    """
+
+    device = (
+        allocation
+        .candidate_by_user_slot
+        .device
+    )
+
+    dtype = (
+        past_average_throughput.dtype
+    )
+
+    num_rbgs = (
+        allocation.num_rbgs
+    )
+
+    #
+    # One synchronization for the tiny scheduling
+    # control matrices, replacing hundreds of .item()
+    # synchronizations.
+    #
+    previous_allocation_cpu = (
+        allocation
+        .candidate_by_user_slot[
+            :user_slot_index,
+            :,
+        ]
+        .detach()
+        .cpu()
+    )
+
+    action_mask_cpu = (
+        action_mask
+        .detach()
+        .cpu()
+    )
+
+    requests: list[
+        tuple[
+            tuple[int, ...],
+            int,
+        ]
+    ] = []
+
+    request_rbg: list[int] = []
+
+    request_action: list[int] = []
+
+    for rbg_index in range(
+        num_rbgs
+    ):
+        previous_candidates = tuple(
+            int(value)
+            for value
+            in (
+                previous_allocation_cpu[
+                    :,
+                    rbg_index,
+                ]
+                .tolist()
+            )
+            if int(value)
+            != NO_ALLOCATION
+        )
+
+        for action in range(
+            num_candidates + 1
+        ):
+            if not bool(
+                action_mask_cpu[
+                    rbg_index,
+                    action,
+                ]
+            ):
+                continue
+
+            if action == num_candidates:
+                hypothetical_candidates = (
+                    previous_candidates
+                )
+
+            else:
+                hypothetical_candidates = (
+                    previous_candidates
+                    + (
+                        action,
+                    )
+                )
+
+            requests.append(
+                (
+                    hypothetical_candidates,
+                    rbg_index,
+                )
+            )
+
+            request_rbg.append(
+                rbg_index
+            )
+
+            request_action.append(
+                action
+            )
+
+    with torch.no_grad():
+        pf_values = score_many_pf(
+            requests,
+            past_average_throughput=(
+                past_average_throughput
+            ),
+            denominator_epsilon=(
+                config
+                .pf_denominator_epsilon
+            ),
+        )
+
+    if tuple(
+        pf_values.shape
+    ) != (
+        len(
+            requests
+        ),
+    ):
+        raise ValueError(
+            "Batched PF scorer returned an "
+            "unexpected shape."
+        )
+
+    if not torch.all(
+        torch.isfinite(
+            pf_values
+        )
+    ):
+        raise ValueError(
+            "Expert PF score is non-finite."
+        )
+
+    pf_matrix = torch.full(
+        (
+            num_rbgs,
+            num_candidates + 1,
+        ),
+        fill_value=float(
+            "-inf"
+        ),
+        dtype=dtype,
+        device=device,
+    )
+
+    request_rbg_tensor = torch.tensor(
+        request_rbg,
+        dtype=torch.long,
+        device=device,
+    )
+
+    request_action_tensor = torch.tensor(
+        request_action,
+        dtype=torch.long,
+        device=device,
+    )
+
+    pf_matrix[
+        request_rbg_tensor,
+        request_action_tensor,
+    ] = pf_values
+
+    #
+    # Preserve the EXISTING sequential tie semantics
+    # exactly.
+    #
+    # One matrix transfer per layer is acceptable and
+    # dramatically cheaper than .item() per action.
+    #
+    pf_matrix_cpu = (
+        pf_matrix
+        .detach()
+        .cpu()
+    )
+
+    expert_action_values: list[int] = []
+
+    best_pf_values: list[float] = []
+
+    for rbg_index in range(
+        num_rbgs
+    ):
+        best_action: int | None = None
+
+        best_pf_value: float | None = None
+
+        for action in range(
+            num_candidates + 1
+        ):
+            if not bool(
+                action_mask_cpu[
+                    rbg_index,
+                    action,
+                ]
+            ):
+                continue
+
+            pf_value = float(
+                pf_matrix_cpu[
+                    rbg_index,
+                    action,
+                ]
+            )
+
+            if best_action is None:
+                best_action = action
+                best_pf_value = pf_value
+                continue
+
+            assert (
+                best_pf_value
+                is not None
+            )
+
+            improvement = (
+                pf_value
+                - best_pf_value
+            )
+
+            if (
+                improvement
+                > config.pf_tie_epsilon
+            ):
+                best_action = action
+                best_pf_value = pf_value
+                continue
+
+            is_tie = (
+                abs(
+                    improvement
+                )
+                <= config.pf_tie_epsilon
+            )
+
+            if (
+                is_tie
+                and _should_replace_on_tie(
+                    new_action=action,
+                    current_action=(
+                        best_action
+                    ),
+                    num_candidates=(
+                        num_candidates
+                    ),
+                    tie_breaking=(
+                        config.tie_breaking
+                    ),
+                )
+            ):
+                best_action = action
+                best_pf_value = pf_value
+
+        if (
+            best_action is None
+            or best_pf_value is None
+        ):
+            raise RuntimeError(
+                "PF expert found no legal action "
+                "for an RBG."
+            )
+
+        expert_action_values.append(
+            best_action
+        )
+
+        best_pf_values.append(
+            best_pf_value
+        )
+
+    expert_actions = torch.tensor(
+        expert_action_values,
+        dtype=torch.long,
+        device=device,
+    )
+
+    best_pf_sum = torch.tensor(
+        best_pf_values,
+        dtype=dtype,
+        device=device,
+    )
+
+    return PPOPFExpertActionData(
+        expert_actions=expert_actions,
+        best_pf_sum=best_pf_sum,
+        action_mask=(
+            action_mask
+            .detach()
+            .clone()
+        ),
+        num_phy_evaluations=(
+            len(
+                requests
+            )
+        ),
+    )
+
 def generate_ppo_pf_expert_actions(
     *,
     allocation: CellAllocation,
@@ -377,6 +703,43 @@ def generate_ppo_pf_expert_actions(
             ),
         )
     )
+
+    #
+    # Optimized physical scorer exposes a batched PF
+    # interface. Plain function callbacks used by unit
+    # tests/classical scaffolding retain the original
+    # scalar implementation below.
+    #
+    score_many_pf = getattr(
+        score_rbg,
+        "score_many_pf",
+        None,
+    )
+
+    if callable(
+        score_many_pf
+    ):
+        return (
+            _generate_ppo_pf_expert_actions_batched(
+                allocation=allocation,
+                user_slot_index=(
+                    user_slot_index
+                ),
+                num_candidates=(
+                    num_candidates
+                ),
+                past_average_throughput=(
+                    past_average_throughput
+                ),
+                action_mask=(
+                    action_mask
+                ),
+                score_many_pf=(
+                    score_many_pf
+                ),
+                config=config,
+            )
+        )
 
     #
     # Actor convention:
