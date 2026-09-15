@@ -6,7 +6,6 @@ import torch
 
 from oran_scheduler.phy.csi import (
     compute_ideal_svd_csi,
-    extract_serving_mimo_rbg_channel,
 )
 from oran_scheduler.phy.link_adaptation import (
     LinkAdaptationConfig,
@@ -59,6 +58,9 @@ from oran_scheduler.schedulers.pf_tds import (
 from oran_scheduler.state.cqi_features import (
     CQISurrogateConfig,
     build_cqi_surrogate,
+)
+from oran_scheduler.utils.perf_timing import (
+    perf_region,
 )
 
 
@@ -2478,25 +2480,47 @@ def _build_cell_training_inputs(
         # Sionna objects are reused.
         #
 
-        channel = (
-            context
-            .channel_runtime
-            .generate(
-                topology=(
-                    microbatch_topology
-                ),
+        # channel = (
+        #     context
+        #     .channel_runtime
+        #     .generate(
+        #         topology=(
+        #             microbatch_topology
+        #         ),
 
-                seed=(
-                    channel_seed
-                ),
+        #         seed=(
+        #             channel_seed
+        #         ),
 
-                batch_size=(
-                    context
-                    .topology_config
-                    .batch_size
-                ),
+        #         batch_size=(
+        #             context
+        #             .topology_config
+        #             .batch_size
+        #         ),
+        #     )
+        # )
+
+        with perf_region(
+            "radio.channel_generation",
+            device=context.config.device,
+        ):
+            channel = (
+                context
+                .channel_runtime
+                .generate(
+                    topology=(
+                        microbatch_topology
+                    ),
+                    seed=(
+                        channel_seed
+                    ),
+                    batch_size=(
+                        context
+                        .topology_config
+                        .batch_size
+                    ),
+                )
             )
-        )
 
         #
         # This H is intentionally retained.
@@ -2559,117 +2583,177 @@ def _build_cell_training_inputs(
         # RI / CSI
         # ======================================================
 
-        rank_data = (
-            compute_ideal_svd_rank_diagnostic(
-                h_freq=h_freq,
+        # rank_data = (
+        #     compute_ideal_svd_rank_diagnostic(
+        #         h_freq=h_freq,
 
-                serving_bs=(
-                    local_serving_bs
-                ),
+        #         serving_bs=(
+        #             local_serving_bs
+        #         ),
 
-                num_rbgs=(
-                    context
-                    .config
-                    .num_rbgs
-                ),
+        #         num_rbgs=(
+        #             context
+        #             .config
+        #             .num_rbgs
+        #         ),
 
-                tx_power_per_subcarrier_w=(
-                    context
-                    .tx_power_per_subcarrier_w
-                ),
+        #         tx_power_per_subcarrier_w=(
+        #             context
+        #             .tx_power_per_subcarrier_w
+        #         ),
 
-                noise_power_per_subcarrier_w=(
-                    context
-                    .noise_power_per_subcarrier_w
-                ),
+        #         noise_power_per_subcarrier_w=(
+        #             context
+        #             .noise_power_per_subcarrier_w
+        #         ),
+        #     )
+        # )
+
+
+        with perf_region(
+            "radio.rank_diagnostic",
+            device=context.config.device,
+        ):
+            rank_data = (
+                compute_ideal_svd_rank_diagnostic(
+                    h_freq=h_freq,
+                    serving_bs=(
+                        local_serving_bs
+                    ),
+                    num_rbgs=(
+                        context
+                        .config
+                        .num_rbgs
+                    ),
+                    tx_power_per_subcarrier_w=(
+                        context
+                        .tx_power_per_subcarrier_w
+                    ),
+                    noise_power_per_subcarrier_w=(
+                        context
+                        .noise_power_per_subcarrier_w
+                    ),
+                )
             )
-        )
 
-        serving_mimo = (
-            extract_serving_mimo_rbg_channel(
-                h_freq=h_freq,
+        # serving_mimo = (
+        #     extract_serving_mimo_rbg_channel(
+        #         h_freq=h_freq,
 
-                serving_bs=(
-                    local_serving_bs
-                ),
+        #         serving_bs=(
+        #             local_serving_bs
+        #         ),
 
-                num_rbgs=(
-                    context
-                    .config
-                    .num_rbgs
-                ),
+        #         num_rbgs=(
+        #             context
+        #             .config
+        #             .num_rbgs
+        #         ),
+        #     )
+        # )
+
+        # csi_data = compute_ideal_svd_csi(
+        #     h_serving_rbg=(
+        #         rank_data
+        #         .h_serving_rbg
+        #     ),
+
+        #     rank1_rbg_score=(
+        #         rank_data
+        #         .rank1_rbg_spectral_efficiency
+        #     ),
+
+        #     rank2_rbg_score=(
+        #         rank_data
+        #         .rank2_rbg_spectral_efficiency
+        #     ),
+        # )
+
+        with perf_region(
+            "radio.csi",
+            device=context.config.device,
+        ):
+            csi_data = (
+                compute_ideal_svd_csi(
+                    h_serving_rbg=(
+                        rank_data
+                        .h_serving_rbg
+                    ),
+                    rank1_rbg_score=(
+                        rank_data
+                        .rank1_rbg_spectral_efficiency
+                    ),
+                    rank2_rbg_score=(
+                        rank_data
+                        .rank2_rbg_spectral_efficiency
+                    ),
+                )
             )
-        )
-
-        csi_data = compute_ideal_svd_csi(
-            h_serving_rbg=(
-                serving_mimo
-                .h_serving_rbg
-            ),
-
-            rank1_rbg_score=(
-                rank_data
-                .rank1_rbg_spectral_efficiency
-            ),
-
-            rank2_rbg_score=(
-                rank_data
-                .rank2_rbg_spectral_efficiency
-            ),
-        )
 
         # ======================================================
         # SU REPORTS NEEDED FOR PF-TDS + 1LDS STATE
         # ======================================================
+        with perf_region(
+            "radio.su_reports",
+            device=context.config.device,
+        ):
+            su_report = (
+                build_single_user_phy_reports(
+                    h_freq=h_freq,
 
-        su_report = (
-            build_single_user_phy_reports(
-                h_freq=h_freq,
+                    serving_bs=(
+                        local_serving_bs
+                    ),
 
-                serving_bs=(
-                    local_serving_bs
-                ),
+                    recommended_rank=(
+                        csi_data
+                        .recommended_rank
+                    ),
 
-                recommended_rank=(
-                    csi_data
-                    .recommended_rank
-                ),
+                    precoder_directions=(
+                        csi_data
+                        .precoder_directions
+                    ),
 
-                precoder_directions=(
-                    csi_data
-                    .precoder_directions
-                ),
+                    num_rbgs=(
+                        context.config.num_rbgs
+                    ),
 
-                num_rbgs=(
-                    context.config.num_rbgs
-                ),
+                    subcarriers_per_rbg=(
+                        context
+                        .config
+                        .subcarriers_per_rb
+                    ),
 
-                subcarriers_per_rbg=(
-                    context
-                    .config
-                    .subcarriers_per_rb
-                ),
+                    tx_power_per_subcarrier_w=(
+                        context
+                        .tx_power_per_subcarrier_w
+                    ),
 
-                tx_power_per_subcarrier_w=(
-                    context
-                    .tx_power_per_subcarrier_w
-                ),
+                    noise_power_per_subcarrier_w=(
+                        context
+                        .noise_power_per_subcarrier_w
+                    ),
 
-                noise_power_per_subcarrier_w=(
-                    context
-                    .noise_power_per_subcarrier_w
-                ),
+                    link_adaptation_config=(
+                        context
+                        .link_adaptation_config
+                    ),
 
-                link_adaptation_config=(
-                    context
-                    .link_adaptation_config
-                ),
+                    rate_config=(
+                        context.rate_config
+                    ),
+                    precomputed_serving_channel=(
+                        rank_data
+                        .h_serving_rbg
+                    ),
 
-                rate_config=(
-                    context.rate_config
-                ),
+                    precomputed_inter_cell_covariance=(
+                        rank_data
+                        .inter_cell_covariance
+                    ),
+                )
             )
-        )
 
         local_rbg_rate_bps = (
             su_report
@@ -2696,30 +2780,33 @@ def _build_cell_training_inputs(
                 device=h_freq.device,
             )
         )
+        with perf_region(
+            "radio.cqi",
+            device=context.config.device,
+        ):
+            cqi = build_cqi_surrogate(
+                mcs_index=(
+                    su_report
+                    .link_adaptation
+                    .mcs_index[
+                        0
+                    ]
+                ),
 
-        cqi = build_cqi_surrogate(
-            mcs_index=(
-                su_report
-                .link_adaptation
-                .mcs_index[
-                    0
-                ]
-            ),
+                meets_bler_target=(
+                    su_report
+                    .link_adaptation
+                    .meets_bler_target[
+                        0
+                    ]
+                ),
 
-            meets_bler_target=(
-                su_report
-                .link_adaptation
-                .meets_bler_target[
-                    0
-                ]
-            ),
+                candidate_valid_mask=(
+                    local_valid_mask
+                ),
 
-            candidate_valid_mask=(
-                local_valid_mask
-            ),
-
-            config=CQISurrogateConfig(),
-        )
+                config=CQISurrogateConfig(),
+            )
 
         # ======================================================
         # RETAIN ONLY WHAT SURVIVES THIS MICROBATCH
@@ -2820,7 +2907,6 @@ def _build_cell_training_inputs(
 
         del su_report
 
-        del serving_mimo
 
         del rank_data
 
@@ -2859,18 +2945,21 @@ def _build_cell_training_inputs(
     #
     # PF-TDS happens AFTER this.
     # ==========================================================
+    with perf_region(
+        "radio.combine_microbatches",
+        device=context.config.device,
+    ):
+        observation = (
+            _combine_cell_radio_microbatches(
+                cell_global_ue_indices=(
+                    cell_global_ue_indices
+                ),
 
-    observation = (
-        _combine_cell_radio_microbatches(
-            cell_global_ue_indices=(
-                cell_global_ue_indices
-            ),
-
-            microbatches=(
-                microbatches
-            ),
+                microbatches=(
+                    microbatches
+                ),
+            )
         )
-    )
 
     # ==========================================================
     # LAZY CANDIDATE PHY COMPACTION
@@ -3221,17 +3310,33 @@ class CellChunkedSionnaPPOInputProvider:
         if existing is not None:
             return existing
 
-        inputs = (
-            _build_cell_training_inputs(
-                context=self.context,
+        # inputs = (
+        #     _build_cell_training_inputs(
+        #         context=self.context,
 
-                tti_index=tti_index,
+        #         tti_index=tti_index,
 
-                stream_index=(
-                    stream_index
-                ),
+        #         stream_index=(
+        #             stream_index
+        #         ),
+        #     )
+        # )
+
+        with perf_region(
+            "radio.cell_input_total",
+            device=(
+                self.context
+                .config
+                .device
+            ),
+        ):
+            inputs = (
+                _build_cell_training_inputs(
+                    context=self.context,
+                    tti_index=tti_index,
+                    stream_index=stream_index,
+                )
             )
-        )
 
         self._current_inputs_by_stream[
             stream_index

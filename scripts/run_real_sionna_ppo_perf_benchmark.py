@@ -94,6 +94,11 @@ from oran_scheduler.rl.ppo_checkpoint import (
     save_ppo_model_checkpoint,
 )
 
+from oran_scheduler.utils.perf_timing import (
+    print_perf_timings,
+    reset_perf_timings,
+)
+
 METRICS_PATH = Path(
     "experiments/"
     "perf_gpu_parallel_training_metrics.csv"
@@ -1340,7 +1345,7 @@ def main() -> None:
         tti_start = (
             time.perf_counter()
         )
-
+        reset_perf_timings()
         result = run_multicell_ppo_training(
             start_tti_index=(
                 tti_index
@@ -1466,6 +1471,8 @@ def main() -> None:
         torch.cuda.synchronize(
             DEVICE
         )
+
+        print_perf_timings()
 
         print(
             "  chunked TTI builds:   "
