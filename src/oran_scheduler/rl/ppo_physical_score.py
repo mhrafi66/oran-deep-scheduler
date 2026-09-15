@@ -21,6 +21,10 @@ from oran_scheduler.schedulers.pf_greedy_sds import (
     PFGreedyRBGScore,
 )
 
+from oran_scheduler.utils.perf_timing import (
+    perf_region,
+)
+
 
 @dataclass(frozen=True)
 class PPOPhysicalScoreInputs:
@@ -890,56 +894,60 @@ class CachedPPOPhysicalRBGScorer:
                     device=device,
                 )
 
-                batch_result = (
-                    evaluate_candidate_hypothesis_batch_same_rank_pattern(
-                        selected_candidate_indices=(
-                            selected_candidate_indices
-                        ),
-                        rbg_indices=(
-                            rbg_indices
-                        ),
-                        candidate_ranks=(
-                            self
-                            ._precomputed_candidate_ranks
-                        ),
-                        candidate_rx_combiners=(
-                            self
-                            ._precomputed_candidate_rx_combiners
-                        ),
-                        candidate_serving_channel=(
-                            self
-                            ._precomputed_candidate_serving_channel
-                        ),
-                        candidate_inter_cell_covariance=(
-                            self
-                            ._precomputed_candidate_inter_cell_covariance
-                        ),
-                        csi_subcarrier_index=(
-                            self.inputs
-                            .csi_subcarrier_index
-                        ),
-                        subcarriers_per_rbg=(
-                            self.inputs
-                            .subcarriers_per_rbg
-                        ),
-                        tx_power_per_subcarrier_w=(
-                            self.inputs
-                            .tx_power_per_subcarrier_w
-                        ),
-                        noise_power_per_subcarrier_w=(
-                            self.inputs
-                            .noise_power_per_subcarrier_w
-                        ),
-                        link_adaptation_config=(
-                            self.inputs
-                            .link_adaptation_config
-                        ),
-                        rate_config=(
-                            self.inputs
-                            .rate_config
-                        ),
+                with perf_region(
+                    "scorer.batched_phy",
+                    device=device,
+                ):
+                    batch_result = (
+                        evaluate_candidate_hypothesis_batch_same_rank_pattern(
+                            selected_candidate_indices=(
+                                selected_candidate_indices
+                            ),
+                            rbg_indices=(
+                                rbg_indices
+                            ),
+                            candidate_ranks=(
+                                self
+                                ._precomputed_candidate_ranks
+                            ),
+                            candidate_rx_combiners=(
+                                self
+                                ._precomputed_candidate_rx_combiners
+                            ),
+                            candidate_serving_channel=(
+                                self
+                                ._precomputed_candidate_serving_channel
+                            ),
+                            candidate_inter_cell_covariance=(
+                                self
+                                ._precomputed_candidate_inter_cell_covariance
+                            ),
+                            csi_subcarrier_index=(
+                                self.inputs
+                                .csi_subcarrier_index
+                            ),
+                            subcarriers_per_rbg=(
+                                self.inputs
+                                .subcarriers_per_rbg
+                            ),
+                            tx_power_per_subcarrier_w=(
+                                self.inputs
+                                .tx_power_per_subcarrier_w
+                            ),
+                            noise_power_per_subcarrier_w=(
+                                self.inputs
+                                .noise_power_per_subcarrier_w
+                            ),
+                            link_adaptation_config=(
+                                self.inputs
+                                .link_adaptation_config
+                            ),
+                            rate_config=(
+                                self.inputs
+                                .rate_config
+                            ),
+                        )
                     )
-                )
 
                 for (
                     row_index,
@@ -1030,9 +1038,19 @@ class CachedPPOPhysicalRBGScorer:
                 "wrong device."
             )
 
-        scores = self.score_many(
-            requests
-        )
+        # scores = self.score_many(
+        #     requests
+        # )
+        with perf_region(
+            "scorer.score_many_total",
+            device=(
+                past_average_throughput
+                .device
+            ),
+        ):
+            scores = self.score_many(
+                requests
+            )
 
         num_requests = len(
             requests

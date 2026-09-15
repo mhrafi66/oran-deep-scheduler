@@ -15,6 +15,10 @@ from oran_scheduler.phy.rate import (
     compute_rbg_rates,
 )
 
+from oran_scheduler.utils.perf_timing import (
+    perf_region,
+)
+
 
 @dataclass(frozen=True)
 class BatchedCandidateHypothesisData:
@@ -331,11 +335,15 @@ def _batched_link_adaptation(
     # Now:
     #     construct once for the entire batch.
     #
-    phy_abstraction, illa = (
-        create_link_adaptation_blocks(
-            config
+    with perf_region(
+        "batched_la.blocks",
+        device=device,
+    ):
+        phy_abstraction, illa = (
+            create_link_adaptation_blocks(
+                config
+            )
         )
-    )
 
     for rank_value in (
         1,
@@ -378,36 +386,44 @@ def _batched_link_adaptation(
                 )
             )
 
-        (
-            group_mcs,
-            _,
-        ) = illa(
-            sinr=group_sinr,
-            mcs_table_index=(
-                config.mcs_table_index
-            ),
-            mcs_category=(
-                config.mcs_category
-            ),
-            return_lowest_available_mcs=True,
-        )
+        with perf_region(
+            "batched_la.illa",
+            device=device,
+        ):
+            (
+                group_mcs,
+                _,
+            ) = illa(
+                sinr=group_sinr,
+                mcs_table_index=(
+                    config.mcs_table_index
+                ),
+                mcs_category=(
+                    config.mcs_category
+                ),
+                return_lowest_available_mcs=True,
+            )
 
-        (
-            _,
-            _,
-            _,
-            group_tbler,
-            _,
-        ) = phy_abstraction(
-            mcs_index=group_mcs,
-            sinr=group_sinr,
-            mcs_table_index=(
-                config.mcs_table_index
-            ),
-            mcs_category=(
-                config.mcs_category
-            ),
-        )
+        with perf_region(
+            "batched_la.selected_phy",
+            device=device,
+        ):
+            (
+                _,
+                _,
+                _,
+                group_tbler,
+                _,
+            ) = phy_abstraction(
+                mcs_index=group_mcs,
+                sinr=group_sinr,
+                mcs_table_index=(
+                    config.mcs_table_index
+                ),
+                mcs_category=(
+                    config.mcs_category
+                ),
+            )
 
         mcs_index[
             :,
@@ -835,57 +851,77 @@ def evaluate_candidate_hypothesis_batch_same_rank_pattern(
     # Output:
     #     [H, TX, layer]
     #
-    precoding_matrix = compute_rzf_matrix(
-        effective_channel=(
-            effective_csi_channel
-        ),
-        alpha=rzf_alpha,
-    )
+    # precoding_matrix = compute_rzf_matrix(
+    #     effective_channel=(
+    #         effective_csi_channel
+    #     ),
+    #     alpha=rzf_alpha,
+    # )
+    with perf_region(
+        "batched_phy.rzf",
+        device=device,
+    ):
+        precoding_matrix = compute_rzf_matrix(
+            effective_channel=(
+                effective_csi_channel
+            ),
+            alpha=rzf_alpha,
+        )
 
     #
     # Physical channel:
     #
     #     [H, symbol, SC, layer, RX, TX]
     #
-    layer_physical_channel = (
-        selected_serving_channel[
-            :,
-            layer_ue_indices,
-            :,
-            :,
-            :,
-            :,
-        ]
-        .permute(
-            0,
-            2,
-            3,
-            1,
-            4,
-            5,
-        )
-        .contiguous()
-    )
 
-    layer_inter_cell_covariance = (
-        selected_inter_cell_covariance[
-            :,
-            layer_ue_indices,
-            :,
-            :,
-            :,
-            :,
-        ]
-        .permute(
-            0,
-            2,
-            3,
-            1,
-            4,
-            5,
+    with perf_region(
+        "batched_phy.sinr",
+        device=device,
+    ):
+        layer_physical_channel = (
+            selected_serving_channel[
+                :,
+                layer_ue_indices,
+                :,
+                :,
+                :,
+                :,
+            ]
+            .permute(
+                0,
+                2,
+                3,
+                1,
+                4,
+                5,
+            )
+            .contiguous()
         )
-        .contiguous()
-    )
+
+
+    with perf_region(
+        "batched_phy.sinr",
+        device=device,
+    ):
+        layer_inter_cell_covariance = (
+            selected_inter_cell_covariance[
+                :,
+                layer_ue_indices,
+                :,
+                :,
+                :,
+                :,
+            ]
+            .permute(
+                0,
+                2,
+                3,
+                1,
+                4,
+                5,
+            )
+            .contiguous()
+        )
 
     #
     # Expand each hypothesis's RZF matrix over
@@ -905,24 +941,33 @@ def evaluate_candidate_hypothesis_batch_same_rank_pattern(
     #
     # [H, symbol, SC, layer, RX, transmit_layer]
     #
-    precoded_spatial_channel = (
-        torch.matmul(
-            layer_physical_channel,
-            precoder_for_matmul,
+    with perf_region(
+        "batched_phy.sinr",
+        device=device,
+    ):
+        precoded_spatial_channel = (
+            torch.matmul(
+                layer_physical_channel,
+                precoder_for_matmul,
+            )
         )
-    )
 
-    desired_spatial_channel = (
-        torch.diagonal(
-            precoded_spatial_channel,
-            dim1=-3,
-            dim2=-1,
+
+    with perf_region(
+        "batched_phy.sinr",
+        device=device,
+    ):
+        desired_spatial_channel = (
+            torch.diagonal(
+                precoded_spatial_channel,
+                dim1=-3,
+                dim2=-1,
+            )
+            .movedim(
+                -1,
+                -2,
+            )
         )
-        .movedim(
-            -1,
-            -2,
-        )
-    )
 
     desired_norm = (
         torch.linalg.vector_norm(
@@ -997,22 +1042,30 @@ def evaluate_candidate_hypothesis_batch_same_rank_pattern(
         - desired_power
     )
 
-    inter_cell_interference_power = (
-        torch.einsum(
-            "...lr,...lrs,...ls->...l",
-            mrc_combiner.conj(),
-            layer_inter_cell_covariance,
-            mrc_combiner,
+    with perf_region(
+        "batched_phy.sinr",
+        device=device,
+    ):
+        inter_cell_interference_power = (
+            torch.einsum(
+                "...lr,...lrs,...ls->...l",
+                mrc_combiner.conj(),
+                layer_inter_cell_covariance,
+                mrc_combiner,
+            )
+            .real
         )
-        .real
-    )
 
-    inter_cell_interference_power = (
-        torch.clamp(
-            inter_cell_interference_power,
-            min=0.0,
+    with perf_region(
+        "batched_phy.sinr",
+        device=device,
+    ):
+        inter_cell_interference_power = (
+            torch.clamp(
+                inter_cell_interference_power,
+                min=0.0,
+            )
         )
-    )
 
     noise_power = torch.as_tensor(
         noise_power_per_subcarrier_w,
@@ -1036,27 +1089,36 @@ def evaluate_candidate_hypothesis_batch_same_rank_pattern(
     #
     # [H, symbol, SC, layer]
     #
-    layer_sinr_linear = (
-        desired_power
-        / denominator
-    )
 
-    (
-        mcs_index,
-        tbler,
-    ) = _batched_link_adaptation(
-        layer_sinr_linear=(
-            layer_sinr_linear
-        ),
-        layer_ue_indices=(
-            layer_ue_indices
-        ),
-        layer_index_within_ue=(
-            layer_index_within_ue
-        ),
-        selected_ranks=selected_ranks,
-        config=link_adaptation_config,
-    )
+    with perf_region(
+        "batched_phy.sinr",
+        device=device,
+    ):
+        layer_sinr_linear = (
+            desired_power
+            / denominator
+        )
+
+    with perf_region(
+        "batched_phy.link_adaptation",
+        device=device,
+    ):
+        (
+            mcs_index,
+            tbler,
+        ) = _batched_link_adaptation(
+            layer_sinr_linear=(
+                layer_sinr_linear
+            ),
+            layer_ue_indices=(
+                layer_ue_indices
+            ),
+            layer_index_within_ue=(
+                layer_index_within_ue
+            ),
+            selected_ranks=selected_ranks,
+            config=link_adaptation_config,
+        )
 
     #
     # Existing rate function already supports a real

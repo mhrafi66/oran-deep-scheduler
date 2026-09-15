@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from functools import lru_cache
 
 import torch
 
@@ -7,6 +8,10 @@ from sionna.sys import (
     PHYAbstraction,
 )
 
+
+from oran_scheduler.utils.perf_timing import (
+    perf_region,
+)
 
 @dataclass(frozen=True)
 class LinkAdaptationConfig:
@@ -407,11 +412,15 @@ def select_mu_mimo_rbg_mcs(
         device=device,
     )
 
-    phy_abstraction, illa = (
-        create_link_adaptation_blocks(
-            config
+    with perf_region(
+        "mu_la.blocks",
+        device=device,
+    ):
+        phy_abstraction, illa = (
+            create_link_adaptation_blocks(
+                config
+            )
         )
-    )
 
     for rank_value in (
         1,
@@ -454,35 +463,43 @@ def select_mu_mimo_rbg_mcs(
             group_sinr.unsqueeze(0)
         )
 
-        (
-            group_mcs,
-            group_lowest_mcs,
-        ) = illa(
-            sinr=illa_sinr,
-            mcs_table_index=(
-                config.mcs_table_index
-            ),
-            mcs_category=(
-                config.mcs_category
-            ),
-            return_lowest_available_mcs=True,
-        )
-        (
-            _,
-            _,
-            group_effective_sinr,
-            group_tbler,
-            group_bler,
-        ) = phy_abstraction(
-            mcs_index=group_mcs,
-            sinr=illa_sinr,
-            mcs_table_index=(
-                config.mcs_table_index
-            ),
-            mcs_category=(
-                config.mcs_category
-            ),
-        )
+        with perf_region(
+            "mu_la.illa",
+            device=device,
+        ):
+            (
+                group_mcs,
+                group_lowest_mcs,
+            ) = illa(
+                sinr=illa_sinr,
+                mcs_table_index=(
+                    config.mcs_table_index
+                ),
+                mcs_category=(
+                    config.mcs_category
+                ),
+                return_lowest_available_mcs=True,
+            )
+        with perf_region(
+            "mu_la.selected_phy",
+            device=device,
+        ):
+            (
+                _,
+                _,
+                group_effective_sinr,
+                group_tbler,
+                group_bler,
+            ) = phy_abstraction(
+                mcs_index=group_mcs,
+                sinr=illa_sinr,
+                mcs_table_index=(
+                    config.mcs_table_index
+                ),
+                mcs_category=(
+                    config.mcs_category
+                ),
+            )
         group_mcs = (
             group_mcs.squeeze(0)
         )
@@ -675,6 +692,67 @@ def build_illa_rbg_sinr(
 
     return illa_sinr
 
+def _build_link_adaptation_blocks(
+    *,
+    bler_target: float,
+    precision: str,
+    device: str,
+) -> tuple[
+    PHYAbstraction,
+    InnerLoopLinkAdaptation,
+]:
+    """
+    Construct one Sionna link-adaptation runtime.
+
+    This function deliberately contains the actual
+    object construction so the cached public factory
+    below can reuse the resulting stateless inference
+    blocks.
+
+    The MCS table/category are runtime inputs to the
+    blocks and therefore do not belong to the object
+    construction key.
+    """
+
+    phy_abstraction = PHYAbstraction(
+        precision=precision,
+        device=device,
+    )
+
+    illa = InnerLoopLinkAdaptation(
+        phy_abstraction=phy_abstraction,
+        bler_target=bler_target,
+        precision=precision,
+        device=device,
+    )
+
+    return (
+        phy_abstraction,
+        illa,
+    )
+
+
+@lru_cache(maxsize=16)
+def _cached_link_adaptation_blocks(
+    bler_target: float,
+    precision: str,
+    device: str,
+) -> tuple[
+    PHYAbstraction,
+    InnerLoopLinkAdaptation,
+]:
+    """
+    Reuse configuration-invariant Sionna
+    link-adaptation inference objects.
+    """
+
+    return _build_link_adaptation_blocks(
+        bler_target=bler_target,
+        precision=precision,
+        device=device,
+    )
+
+
 def create_link_adaptation_blocks(
     config: LinkAdaptationConfig,
 ) -> tuple[
@@ -682,24 +760,18 @@ def create_link_adaptation_blocks(
     InnerLoopLinkAdaptation,
 ]:
     """
-    Create Sionna PHY abstraction and inner-loop link adaptation.
+    Return the persistent Sionna PHY-abstraction /
+    ILLA runtime corresponding to this configuration.
+
+    Reuse changes object lifetime only. SINR, MCS
+    table, MCS category, BLER target and all PHY
+    calculations remain unchanged.
     """
 
-    phy_abstraction = PHYAbstraction(
-        precision=config.precision,
-        device=config.device,
-    )
-
-    illa = InnerLoopLinkAdaptation(
-        phy_abstraction=phy_abstraction,
-        bler_target=config.bler_target,
-        precision=config.precision,
-        device=config.device,
-    )
-
-    return (
-        phy_abstraction,
-        illa,
+    return _cached_link_adaptation_blocks(
+        float(config.bler_target),
+        str(config.precision),
+        str(config.device),
     )
 
 def select_rbg_mcs(

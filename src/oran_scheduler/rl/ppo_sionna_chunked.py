@@ -3322,13 +3322,30 @@ class CellChunkedSionnaPPOInputProvider:
         #     )
         # )
 
+        #
+        # Production ChunkedSionnaPPOContext has
+        # context.config.device.
+        #
+        # Some pure-logic unit tests intentionally use
+        # a minimal fake context containing only
+        # num_streams. Profiling must not impose extra
+        # runtime requirements on that interface.
+        #
+        profile_config = getattr(
+            self.context,
+            "config",
+            None,
+        )
+
+        profile_device = getattr(
+            profile_config,
+            "device",
+            None,
+        )
+
         with perf_region(
             "radio.cell_input_total",
-            device=(
-                self.context
-                .config
-                .device
-            ),
+            device=profile_device,
         ):
             inputs = (
                 _build_cell_training_inputs(
