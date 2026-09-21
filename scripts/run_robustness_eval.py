@@ -111,6 +111,15 @@ from oran_scheduler.rl.ppo_checkpoint import (
     save_ppo_model_checkpoint,
 )
 
+from oran_scheduler.schedulers.candidate_runtime_diagnostics import (
+    build_candidate_runtime_diagnostics,
+)
+
+from oran_scheduler.rl.ppo_candidate_intervention import (
+    CandidateInterventionConfig,
+    CandidateInterventionInputProvider,
+)
+
 CSI_DELAY_TTIS = int(
     os.environ.get(
         "CSI_DELAY_TTIS",
@@ -138,6 +147,25 @@ STRESS_TAG = os.environ.get(
         f"_fb{int(round(100 * FB_FRACTION))}"
     ),
 )
+
+CANDIDATE_INTERVENTION_MODE = (
+    os.environ.get(
+        "CANDIDATE_INTERVENTION_MODE",
+        "native",
+    )
+)
+
+if CANDIDATE_INTERVENTION_MODE not in (
+    "native",
+    "fresh_candidates",
+    "fresh_features",
+    "fresh_both",
+):
+    raise ValueError(
+        "CANDIDATE_INTERVENTION_MODE must be one of: "
+        "native, fresh_candidates, fresh_features, "
+        "fresh_both."
+    )
 
 if FB_FRACTION not in {
     0.0,
@@ -261,8 +289,13 @@ CORRUPTION_SEED = int(
 )
 
 TRAINED_CHECKPOINT_PATH = Path(
-    "experiments/checkpoints/"
-    "paper_1lds_ppo_500tti.pt"
+    os.environ.get(
+        "TRAINED_CHECKPOINT_PATH",
+        (
+            "experiments/checkpoints/"
+            "paper_1lds_ppo_500tti.pt"
+        ),
+    )
 )
 
 METRICS_PATH = Path(
@@ -275,6 +308,12 @@ KPI_METRICS_PATH = Path(
     "experiments/stress_tests/"
     "parallel/"
     f"{STRESS_TAG}_kpi.csv"
+)
+
+CANDIDATE_METRICS_PATH = Path(
+    "experiments/stress_tests/"
+    "parallel/"
+    f"{STRESS_TAG}_candidate.csv"
 )
 
 #
@@ -742,6 +781,186 @@ TEMPORARY SMOKE-RUN CHOICE:
         ),
     )
 
+CANDIDATE_CELL_DIAGNOSTIC_FIELDS = (
+    "candidate_eligible_count",
+    "candidate_fresh_count",
+    "candidate_stressed_count",
+    "candidate_jaccard",
+    "candidate_fresh_recall",
+    "candidate_top1_retained",
+    "candidate_has_common",
+    "candidate_rank_displacement",
+    "candidate_set_changed",
+    "candidate_order_exact_match",
+    "candidate_fresh_reported_pf_mean",
+    "candidate_stressed_reported_pf_mean",
+    "candidate_reported_top1_pf_ratio",
+    "candidate_fresh_truth_pf_mean",
+    "candidate_stressed_set_fresh_pf_mean",
+    "candidate_fresh_truth_pf_retention",
+    "candidate_stressed_top1_fresh_pf_ratio",
+)
+
+
+CANDIDATE_AGGREGATE_FIELDS = (
+    "candidate_eligible_count_mean",
+    "candidate_fresh_count_mean",
+    "candidate_stressed_count_mean",
+    "candidate_jaccard_mean",
+    "candidate_fresh_recall_mean",
+    "candidate_top1_retention_rate",
+    "candidate_rank_displacement_mean",
+    "candidate_set_changed_fraction",
+    "candidate_order_exact_match_fraction",
+    "candidate_fresh_truth_pf_retention_mean",
+    "candidate_stressed_top1_fresh_pf_ratio_mean",
+)
+
+
+def _mean_row_value(
+    rows: list[
+        dict[
+            str,
+            float | int,
+        ]
+    ],
+    key: str,
+) -> float:
+    if not rows:
+        raise ValueError(
+            "Cannot average an empty candidate "
+            "diagnostic collection."
+        )
+
+    return sum(
+        float(
+            row[
+                key
+            ]
+        )
+        for row
+        in rows
+    ) / len(
+        rows
+    )
+
+
+def _aggregate_candidate_diagnostics(
+    rows: list[
+        dict[
+            str,
+            float | int,
+        ]
+    ],
+) -> dict[str, float]:
+    if not rows:
+        raise ValueError(
+            "Candidate diagnostic rows cannot be empty."
+        )
+
+    #
+    # Rank displacement has meaning only when the
+    # fresh and stressed candidate sets share at
+    # least one UE.
+    #
+    common_rows = [
+        row
+        for row
+        in rows
+        if float(
+            row[
+                "candidate_has_common"
+            ]
+        ) > 0.5
+    ]
+
+    if common_rows:
+        rank_displacement = (
+            _mean_row_value(
+                common_rows,
+                "candidate_rank_displacement",
+            )
+        )
+    else:
+        rank_displacement = 0.0
+
+    return {
+        "candidate_eligible_count_mean": (
+            _mean_row_value(
+                rows,
+                "candidate_eligible_count",
+            )
+        ),
+
+        "candidate_fresh_count_mean": (
+            _mean_row_value(
+                rows,
+                "candidate_fresh_count",
+            )
+        ),
+
+        "candidate_stressed_count_mean": (
+            _mean_row_value(
+                rows,
+                "candidate_stressed_count",
+            )
+        ),
+
+        "candidate_jaccard_mean": (
+            _mean_row_value(
+                rows,
+                "candidate_jaccard",
+            )
+        ),
+
+        "candidate_fresh_recall_mean": (
+            _mean_row_value(
+                rows,
+                "candidate_fresh_recall",
+            )
+        ),
+
+        "candidate_top1_retention_rate": (
+            _mean_row_value(
+                rows,
+                "candidate_top1_retained",
+            )
+        ),
+
+        "candidate_rank_displacement_mean": (
+            rank_displacement
+        ),
+
+        "candidate_set_changed_fraction": (
+            _mean_row_value(
+                rows,
+                "candidate_set_changed",
+            )
+        ),
+
+        "candidate_order_exact_match_fraction": (
+            _mean_row_value(
+                rows,
+                "candidate_order_exact_match",
+            )
+        ),
+
+        "candidate_fresh_truth_pf_retention_mean": (
+            _mean_row_value(
+                rows,
+                "candidate_fresh_truth_pf_retention",
+            )
+        ),
+
+        "candidate_stressed_top1_fresh_pf_ratio_mean": (
+            _mean_row_value(
+                rows,
+                "candidate_stressed_top1_fresh_pf_ratio",
+            )
+        ),
+    }
+
+
 def main() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError(
@@ -1105,6 +1324,31 @@ def main() -> None:
         )
     )
 
+    input_provider = (
+        CandidateInterventionInputProvider(
+            fresh_provider=(
+                radio_input_provider
+            ),
+
+            stressed_provider=(
+                input_provider
+            ),
+
+            config=(
+                CandidateInterventionConfig(
+                    mode=(
+                        CANDIDATE_INTERVENTION_MODE
+                    )
+                )
+            ),
+        )
+    )
+
+    print(
+        "Candidate intervention:   "
+        f"{CANDIDATE_INTERVENTION_MODE}"
+    )
+
     print(
         "CSI delay TTIs:           "
         f"{CSI_DELAY_TTIS}"
@@ -1304,6 +1548,142 @@ def main() -> None:
 
 
 
+
+
+    # ==========================================================
+    # PF-TDS CANDIDATE COUNTERFACTUAL DIAGNOSTICS
+    # ==========================================================
+
+    candidate_diagnostics_by_tti: dict[
+        int,
+        list[
+            dict[
+                str,
+                float | int,
+            ]
+        ],
+    ] = {}
+
+    def candidate_preparation_observer(
+        tti_index: int,
+        cell_index: int,
+        preparation,
+    ) -> None:
+
+        #
+        # The stress-provider chain has already caused
+        # this TTI/cell to be materialized by the raw
+        # Sionna provider.
+        #
+        # Calling radio_input_provider() again for the
+        # same TTI/cell returns its cached CURRENT
+        # observation. It does not rebuild the PHY.
+        #
+        fresh_inputs = (
+            radio_input_provider(
+                tti_index,
+                cell_index,
+            )
+        )
+
+        fresh_observation = (
+            fresh_inputs
+            .observation
+        )
+
+        stressed_observation = (
+            preparation
+            .scheduler_observation
+        )
+
+        if not torch.equal(
+            fresh_observation
+            .serving_global_ue_indices,
+            stressed_observation
+            .serving_global_ue_indices,
+        ):
+            raise RuntimeError(
+                "Fresh and stressed candidate diagnostics "
+                "refer to different serving UE identities."
+            )
+
+        state_manager = (
+            state_managers[
+                cell_index
+            ]
+        )
+
+        diagnostics = (
+            build_candidate_runtime_diagnostics(
+                fresh_instantaneous_rate_bps=(
+                    fresh_observation
+                    .td_instantaneous_rate_bps
+                ),
+
+                stressed_instantaneous_rate_bps=(
+                    stressed_observation
+                    .td_instantaneous_rate_bps
+                ),
+
+                #
+                # PRE-TTI PF history.
+                #
+                # complete_tti() has not yet updated
+                # throughput history.
+                #
+                past_average_throughput_bps=(
+                    state_manager
+                    .current_average_throughput_bps
+                ),
+
+                #
+                # Exact traffic-aware eligibility used
+                # by the ACTUAL PF-TDS scheduler.
+                #
+                eligible_mask=(
+                    preparation
+                    .tds_eligibility
+                    .eligible_mask
+                ),
+
+                config=(
+                    state_manager
+                    .tds_config
+                ),
+
+                #
+                # This assertion inside the diagnostic
+                # helper proves that our reconstructed
+                # stressed candidate set is identical
+                # to the set actually passed downstream.
+                #
+                actual_stressed_result=(
+                    preparation
+                    .prepared
+                    .tds_result
+                ),
+            )
+        )
+
+        row: dict[
+            str,
+            float | int,
+        ] = {
+            "tti": tti_index,
+            "cell_index": cell_index,
+            **diagnostics,
+        }
+
+        (
+            candidate_diagnostics_by_tti
+            .setdefault(
+                tti_index,
+                [],
+            )
+            .append(
+                row
+            )
+        )
 
 
     # radio_input_provider = (
@@ -1661,6 +2041,7 @@ def main() -> None:
         "jsd_updates_this_tti",
         "mean_td_rate_mbps",
         "mean_wideband_cqi",
+        *CANDIDATE_AGGREGATE_FIELDS,
         "actor_norm",
         "critic_norm",
         "actor_loss",
@@ -1679,6 +2060,25 @@ def main() -> None:
             metrics_file,
             fieldnames=metrics_fieldnames,
         )
+        writer.writeheader()
+
+    candidate_fieldnames = [
+        "tti",
+        "cell_index",
+        *CANDIDATE_CELL_DIAGNOSTIC_FIELDS,
+    ]
+
+    with CANDIDATE_METRICS_PATH.open(
+        "w",
+        newline="",
+    ) as candidate_file:
+        writer = csv.DictWriter(
+            candidate_file,
+            fieldnames=(
+                candidate_fieldnames
+            ),
+        )
+
         writer.writeheader()
 
     for tti_index in range(
@@ -1821,6 +2221,10 @@ def main() -> None:
 
             reward_reduction="mean",
 
+            preparation_observer=(
+                candidate_preparation_observer
+            ),
+
             cell_result_observer=(
                 kpi_observer
             ),
@@ -1877,6 +2281,59 @@ def main() -> None:
             .item()
         )
 
+        candidate_rows = (
+            candidate_diagnostics_by_tti
+            .pop(
+                tti_index,
+                [],
+            )
+        )
+
+        expected_candidate_rows = len(
+            state_managers
+        )
+
+        if len(
+            candidate_rows
+        ) != expected_candidate_rows:
+            raise RuntimeError(
+                "Expected one candidate diagnostic row "
+                "per PPO cell. "
+                f"TTI={tti_index}, "
+                f"expected={expected_candidate_rows}, "
+                f"got={len(candidate_rows)}."
+            )
+
+        candidate_rows = sorted(
+            candidate_rows,
+            key=lambda row: int(
+                row[
+                    "cell_index"
+                ]
+            ),
+        )
+
+        candidate_summary = (
+            _aggregate_candidate_diagnostics(
+                candidate_rows
+            )
+        )
+
+        with CANDIDATE_METRICS_PATH.open(
+            "a",
+            newline="",
+        ) as candidate_file:
+            writer = csv.DictWriter(
+                candidate_file,
+                fieldnames=(
+                    candidate_fieldnames
+                ),
+            )
+
+            writer.writerows(
+                candidate_rows
+            )
+
         print(
             "  stream-0 mean TD rate:"
             f" {mean_td_rate_mbps:.3f} Mbps"
@@ -1885,6 +2342,31 @@ def main() -> None:
         print(
             "  stream-0 mean WB CQI: "
             f"{mean_wideband_cqi:.3f}"
+        )
+
+        print(
+            "  candidate Jaccard:    "
+            f"{candidate_summary['candidate_jaccard_mean']:.4f}"
+        )
+
+        print(
+            "  fresh cand. recall:   "
+            f"{candidate_summary['candidate_fresh_recall_mean']:.4f}"
+        )
+
+        print(
+            "  top-1 retention:      "
+            f"{candidate_summary['candidate_top1_retention_rate']:.4f}"
+        )
+
+        print(
+            "  cells changed set:    "
+            f"{candidate_summary['candidate_set_changed_fraction']:.4f}"
+        )
+
+        print(
+            "  fresh-PF quality ret: "
+            f"{candidate_summary['candidate_fresh_truth_pf_retention_mean']:.4f}"
         )
 
         elapsed = (
@@ -2175,6 +2657,9 @@ def main() -> None:
             "mean_wideband_cqi": (
                 mean_wideband_cqi
             ),
+
+            **candidate_summary,
+
             "actor_norm": (
                 current_actor_norm
             ),
@@ -2280,6 +2765,12 @@ def main() -> None:
             f"{CHECKPOINT_PATH}"
         )
 
+
+    if candidate_diagnostics_by_tti:
+        raise RuntimeError(
+            "Unwritten candidate diagnostics remain "
+            "after the evaluation loop."
+        )
 
     total_elapsed = (
         time.perf_counter()
@@ -2749,6 +3240,11 @@ def main() -> None:
     print(
         "KPI metrics CSV:         "
         f"{KPI_METRICS_PATH}"
+    )
+
+    print(
+        "Candidate metrics CSV:   "
+        f"{CANDIDATE_METRICS_PATH}"
     )
 
     print(

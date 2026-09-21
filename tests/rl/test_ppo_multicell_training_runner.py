@@ -172,6 +172,21 @@ def test_multicell_runner_updates_before_next_tti_actions(
 
     execution_events = []
 
+    preparation_events = []
+
+    def preparation_observer(
+        tti_index: int,
+        cell_index: int,
+        preparation,
+    ) -> None:
+        preparation_events.append(
+            (
+                tti_index,
+                cell_index,
+                preparation.tti_index,
+            )
+        )
+
     def build_state(
         *,
         tti_index: int,
@@ -392,6 +407,9 @@ def test_multicell_runner_updates_before_next_tti_actions(
                     first_collection_tti_index=0,
                 )
             ),
+            preparation_observer=(
+                preparation_observer
+            ),
             device=device,
         )
     )
@@ -468,5 +486,16 @@ def test_multicell_runner_updates_before_next_tti_actions(
         .final_transition_buffer_size
         == 2
     )
+
+    #
+    # Preparation callback happens once per cell,
+    # before the current-TTI actor execution.
+    #
+    assert preparation_events == [
+        (0, 0, 0),
+        (0, 1, 0),
+        (1, 0, 1),
+        (1, 1, 1),
+    ]
 
 

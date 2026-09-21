@@ -35,6 +35,7 @@ from oran_scheduler.rl.ppo_training_runner import (
 )
 from oran_scheduler.rl.ppo_traffic_cell_step import (
     PPOTrafficRewardPopulation,
+    PreparedTrafficAwarePPOCellTTI,
     TrafficAwarePPOCellTTIStepResult,
     prepare_traffic_aware_ppo_cell_tti,
     run_traffic_aware_ppo_cell_tti_step,
@@ -73,6 +74,16 @@ PPOMultiCellResultObserver = Callable[
         int,
         int,
         TrafficAwarePPOCellTTIStepResult,
+    ],
+    None,
+]
+
+
+PPOMultiCellPreparationObserver = Callable[
+    [
+        int,
+        int,
+        PreparedTrafficAwarePPOCellTTI,
     ],
     None,
 ]
@@ -165,6 +176,9 @@ def run_multicell_ppo_training(
     reward_reduction: (
         PPORewardReduction
     ) = "mean",
+    preparation_observer: (
+        PPOMultiCellPreparationObserver | None
+    ) = None,
     cell_result_observer: (
         PPOMultiCellResultObserver | None
     ) = None,
@@ -429,6 +443,13 @@ def run_multicell_ppo_training(
                         ),
                         device=device,
                     )
+                )
+
+            if preparation_observer is not None:
+                preparation_observer(
+                    tti_index,
+                    cell_index,
+                    preparation,
                 )
 
             preparations.append(
