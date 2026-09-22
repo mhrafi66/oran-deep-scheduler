@@ -68,11 +68,7 @@ if [[ "${TASKS}" -ne 132 ]]; then
 fi
 
 
-LAST_TASK=$(
-    (
-        TASKS - 1
-    )
-)
+LAST_TASK=$(( TASKS - 1 ))
 
 
 RUN_ID="wave5net_$(date +%Y%m%d_%H%M%S)"
