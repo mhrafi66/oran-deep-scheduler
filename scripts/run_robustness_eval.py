@@ -2503,7 +2503,7 @@ def main() -> None:
 
         controllers = []
 
-        for _ in range(
+        for stream_index in range(
             len(
                 traffic_managers
             )
@@ -2551,8 +2551,13 @@ def main() -> None:
                                     CONTROL_MISS_POLICY
                                 ),
 
+                                #
+                                # Deterministic but different
+                                # timing process per cell.
+                                #
                                 seed=(
                                     SEED
+                                    + stream_index
                                 ),
                             )
                         ),

@@ -211,11 +211,16 @@ case "${W5_FAMILY}" in
 
         export CONTROL_LOOP_ENABLE=1
 
+        #
+        # Synthetic mixed hit/miss control timing.
+        #
+        # This is NOT measured inference latency.
+        #
         export CONTROL_DEADLINE_MS=0.5
 
-        export CONTROL_BASE_COMPUTE_MS=0.8
+        export CONTROL_BASE_COMPUTE_MS=0.45
 
-        export CONTROL_JITTER_STD_MS=0.0
+        export CONTROL_JITTER_STD_MS=0.10
 
         export CONTROL_MISS_POLICY=empty
         ;;
@@ -225,11 +230,16 @@ case "${W5_FAMILY}" in
 
         export CONTROL_LOOP_ENABLE=1
 
+        #
+        # SAME latency process as deadline_empty.
+        #
+        # Only miss recovery policy differs.
+        #
         export CONTROL_DEADLINE_MS=0.5
 
-        export CONTROL_BASE_COMPUTE_MS=0.8
+        export CONTROL_BASE_COMPUTE_MS=0.45
 
-        export CONTROL_JITTER_STD_MS=0.0
+        export CONTROL_JITTER_STD_MS=0.10
 
         export CONTROL_MISS_POLICY=repeat_previous
         ;;
