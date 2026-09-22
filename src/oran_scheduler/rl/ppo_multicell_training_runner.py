@@ -34,6 +34,7 @@ from oran_scheduler.rl.ppo_training_runner import (
     PPOTrainingTTIInputs,
 )
 from oran_scheduler.rl.ppo_traffic_cell_step import (
+    PPOExecutionScheduleTransform,
     PPOTrafficRewardPopulation,
     PreparedTrafficAwarePPOCellTTI,
     TrafficAwarePPOCellTTIStepResult,
@@ -182,6 +183,15 @@ def run_multicell_ppo_training(
     cell_result_observer: (
         PPOMultiCellResultObserver | None
     ) = None,
+
+    execution_schedule_transforms: (
+        tuple[
+            PPOExecutionScheduleTransform | None,
+            ...
+        ]
+        | None
+    ) = None,
+
     device: str | torch.device = "cuda:0",
 ) -> PPOMultiCellTrainingRunResult:
     """
@@ -239,6 +249,19 @@ def run_multicell_ppo_training(
         raise ValueError(
             "rollout_controllers must contain one "
             "entry per centralized stream."
+        )
+
+
+    if (
+        execution_schedule_transforms
+        is not None
+        and len(
+            execution_schedule_transforms
+        ) != num_cells
+    ):
+        raise ValueError(
+            "execution_schedule_transforms must "
+            "contain one entry per cell."
         )
 
     shared_transition_buffer = (
@@ -586,6 +609,19 @@ def run_multicell_ppo_training(
                         preparation=(
                             preparation
                         ),
+                        execution_schedule_transform=(
+                            None
+                            if (
+                                execution_schedule_transforms
+                                is None
+                            )
+                            else (
+                                execution_schedule_transforms[
+                                    cell_index
+                                ]
+                            )
+                        ),
+
                         reward_reduction=(
                             reward_reduction
                         ),

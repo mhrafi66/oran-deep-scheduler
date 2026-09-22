@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from collections.abc import Callable
 from typing import Literal
 
 import torch
@@ -195,6 +196,16 @@ class TrafficAwarePPOCellTTIStepResult:
 
     history_update: CellThroughputHistoryUpdate
 
+    #
+    # When execution-time control modifies the
+    # actor's requested schedule, schedule contains
+    # the EXECUTED schedule while policy_schedule
+    # preserves the actor output.
+    #
+    policy_schedule: (
+        OneLDSScheduleResult | None
+    ) = None
+
 
 
 @dataclass(frozen=True)
@@ -230,6 +241,18 @@ class PreparedTrafficAwarePPOCellTTI:
     physical_inputs: PPOPhysicalScoreInputs
 
     first_decision: OneLDSDecisionData
+
+
+PPOExecutionScheduleTransform: TypeAlias = (
+    Callable[
+        [
+            int,
+            OneLDSScheduleResult,
+            PreparedTrafficAwarePPOCellTTI,
+        ],
+        OneLDSScheduleResult,
+    ]
+)
 
 
 
@@ -777,6 +800,11 @@ def run_traffic_aware_ppo_cell_tti_step(
     preparation: (
         PreparedTrafficAwarePPOCellTTI | None
     ) = None,
+
+    execution_schedule_transform: (
+        PPOExecutionScheduleTransform | None
+    ) = None,
+
     reward_reduction: PPORewardReduction = "mean",
     packet_arrivals: torch.Tensor | None = None,
     device: str | torch.device = "cuda:0",
@@ -1025,6 +1053,67 @@ def run_traffic_aware_ppo_cell_tti_step(
             "does not match the actual 1LDS slot-0 "
             "mask."
         )
+
+    policy_schedule = schedule
+
+    if (
+        execution_schedule_transform
+        is not None
+    ):
+        if collect_experience:
+            raise RuntimeError(
+                "Execution-time schedule transforms "
+                "are currently evaluation-only. "
+                "They cannot be enabled during "
+                "on-policy PPO collection."
+            )
+
+        transformed_schedule = (
+            execution_schedule_transform(
+                tti_index,
+                policy_schedule,
+                preparation,
+            )
+        )
+
+        if not isinstance(
+            transformed_schedule,
+            OneLDSScheduleResult,
+        ):
+            raise TypeError(
+                "execution_schedule_transform must "
+                "return OneLDSScheduleResult."
+            )
+
+        if (
+            transformed_schedule
+            .actions
+            .shape
+            != policy_schedule
+            .actions
+            .shape
+        ):
+            raise ValueError(
+                "Execution transform changed the "
+                "scheduler action tensor shape."
+            )
+
+        if (
+            transformed_schedule
+            .allocation
+            .candidate_by_user_slot
+            .shape
+            != policy_schedule
+            .allocation
+            .candidate_by_user_slot
+            .shape
+        ):
+            raise ValueError(
+                "Execution transform changed the "
+                "allocation shape."
+            )
+
+        schedule = transformed_schedule
 
     # ----------------------------------------------------------
     # SHARED COUNTERFACTUAL PHY CACHE
@@ -1483,6 +1572,15 @@ def run_traffic_aware_ppo_cell_tti_step(
         ),
         history_update=(
             history_update
+        ),
+
+        policy_schedule=(
+            policy_schedule
+            if (
+                execution_schedule_transform
+                is not None
+            )
+            else None
         ),
     )
 

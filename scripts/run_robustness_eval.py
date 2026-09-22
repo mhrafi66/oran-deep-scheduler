@@ -82,6 +82,18 @@ from oran_scheduler.simulator.traffic import (
     TrafficBufferManager,
     build_training_ftp3_config,
 )
+
+from oran_scheduler.simulator.runtime_scenario import (
+    RuntimeScenarioController,
+    parse_runtime_scenario_json,
+)
+
+from oran_scheduler.simulator.service_metrics import (
+    SERVICE_AGGREGATE_FIELDS,
+    SERVICE_CELL_FIELDS,
+    RuntimeServiceMetrics,
+    aggregate_service_rows,
+)
 from oran_scheduler.state.one_lds import (
     OneLDSStateConfig,
 )
@@ -120,6 +132,15 @@ from oran_scheduler.rl.ppo_candidate_intervention import (
     CandidateInterventionInputProvider,
 )
 
+from oran_scheduler.rl.physical_input_stress import (
+    PhysicalExecutionStressConfig,
+    PhysicalExecutionStressInputProvider,
+)
+
+from oran_scheduler.schedulers.classical_multicell_eval import (
+    run_multicell_classical_evaluation,
+)
+
 CSI_DELAY_TTIS = int(
     os.environ.get(
         "CSI_DELAY_TTIS",
@@ -139,6 +160,25 @@ FB_FRACTION = float(
     )
 )
 
+from oran_scheduler.simulator.packet_qos_runtime import (
+    PacketQoSTrafficBufferManager,
+)
+from oran_scheduler.simulator.scheduled_physical_stress import (
+    ScheduledPhysicalExecutionStressInputProvider,
+    parse_physical_network_scenario_json,
+)
+from oran_scheduler.simulator.ue_availability import (
+    UEAvailabilityInputProvider,
+    parse_ue_availability_scenario_json,
+)
+from oran_scheduler.simulator.control_loop import (
+    ControlLoopTimingConfig,
+)
+from oran_scheduler.rl.control_execution import (
+    CandidateGatedControlLoopPPOExecutionController,
+    CandidateGatedDelayedPPOExecutionController,
+)
+
 STRESS_TAG = os.environ.get(
     "STRESS_TAG",
     (
@@ -147,6 +187,50 @@ STRESS_TAG = os.environ.get(
         f"_fb{int(round(100 * FB_FRACTION))}"
     ),
 )
+
+SCHEDULER_MODE = os.environ.get(
+    "SCHEDULER_MODE",
+    "ppo",
+)
+
+if SCHEDULER_MODE not in (
+    "ppo",
+    "baseline",
+    "pf_greedy",
+):
+    raise ValueError(
+        "SCHEDULER_MODE must be "
+        "ppo, baseline, or pf_greedy."
+    )
+
+
+POST_CSI_INTERFERENCE_POWER_SCALE = float(
+    os.environ.get(
+        "POST_CSI_INTERFERENCE_POWER_SCALE",
+        "1.0",
+    )
+)
+
+POST_CSI_SERVING_POWER_SCALE = float(
+    os.environ.get(
+        "POST_CSI_SERVING_POWER_SCALE",
+        "1.0",
+    )
+)
+
+_raw_failed_bs = os.environ.get(
+    "POST_CSI_FAILED_BS",
+    "",
+)
+
+POST_CSI_FAILED_BS = (
+    None
+    if _raw_failed_bs.strip() == ""
+    else int(
+        _raw_failed_bs
+    )
+)
+
 
 CANDIDATE_INTERVENTION_MODE = (
     os.environ.get(
@@ -288,6 +372,11 @@ CORRUPTION_SEED = int(
     )
 )
 
+RUNTIME_SCENARIO_JSON = os.environ.get(
+    "RUNTIME_SCENARIO_JSON",
+    "",
+)
+
 TRAINED_CHECKPOINT_PATH = Path(
     os.environ.get(
         "TRAINED_CHECKPOINT_PATH",
@@ -304,6 +393,116 @@ METRICS_PATH = Path(
     f"{STRESS_TAG}_metrics.csv"
 )
 
+# ==============================================================
+# WAVE-5 NETWORKING EXTENSIONS
+# ==============================================================
+
+PACKET_QOS_ENABLE = (
+    os.environ.get(
+        "PACKET_QOS_ENABLE",
+        "0",
+    )
+    == "1"
+)
+
+PACKET_QOS_DEADLINE_TTIS_RAW = (
+    os.environ.get(
+        "PACKET_QOS_DEADLINE_TTIS",
+        "",
+    )
+)
+
+PACKET_QOS_DEADLINE_TTIS = (
+    None
+    if PACKET_QOS_DEADLINE_TTIS_RAW == ""
+    else int(
+        PACKET_QOS_DEADLINE_TTIS_RAW
+    )
+)
+
+PACKET_QOS_PATH = Path(
+    "experiments/stress_tests/"
+    "parallel/"
+    f"{STRESS_TAG}_packet_qos.csv"
+)
+
+
+PHYSICAL_NETWORK_SCENARIO_JSON = (
+    os.environ.get(
+        "PHYSICAL_NETWORK_SCENARIO_JSON",
+        "",
+    )
+)
+
+
+UE_AVAILABILITY_SCENARIO_JSON = (
+    os.environ.get(
+        "UE_AVAILABILITY_SCENARIO_JSON",
+        "",
+    )
+)
+
+
+EXECUTION_DELAY_TTIS = int(
+    os.environ.get(
+        "EXECUTION_DELAY_TTIS",
+        "0",
+    )
+)
+
+if EXECUTION_DELAY_TTIS < 0:
+    raise ValueError(
+        "EXECUTION_DELAY_TTIS cannot be negative."
+    )
+
+
+CONTROL_LOOP_ENABLE = (
+    os.environ.get(
+        "CONTROL_LOOP_ENABLE",
+        "0",
+    )
+    == "1"
+)
+
+CONTROL_DEADLINE_MS = float(
+    os.environ.get(
+        "CONTROL_DEADLINE_MS",
+        "0.5",
+    )
+)
+
+CONTROL_BASE_COMPUTE_MS = float(
+    os.environ.get(
+        "CONTROL_BASE_COMPUTE_MS",
+        "0.0",
+    )
+)
+
+CONTROL_JITTER_STD_MS = float(
+    os.environ.get(
+        "CONTROL_JITTER_STD_MS",
+        "0.0",
+    )
+)
+
+CONTROL_MISS_POLICY = (
+    os.environ.get(
+        "CONTROL_MISS_POLICY",
+        "empty",
+    )
+)
+
+if (
+    EXECUTION_DELAY_TTIS > 0
+    and CONTROL_LOOP_ENABLE
+):
+    raise ValueError(
+        "Enable either fixed execution delay OR "
+        "control-loop timing in one experiment, "
+        "not both simultaneously."
+    )
+
+
 KPI_METRICS_PATH = Path(
     "experiments/stress_tests/"
     "parallel/"
@@ -314,6 +513,12 @@ CANDIDATE_METRICS_PATH = Path(
     "experiments/stress_tests/"
     "parallel/"
     f"{STRESS_TAG}_candidate.csv"
+)
+
+SERVICE_METRICS_PATH = Path(
+    "experiments/stress_tests/"
+    "parallel/"
+    f"{STRESS_TAG}_service.csv"
 )
 
 #
@@ -373,6 +578,59 @@ TOPOLOGY_SEED = int(
         "42",
     )
 )
+
+
+# ==============================================================
+# WAVE-4 TEMPORAL RADIO / MOBILITY
+# ==============================================================
+
+TEMPORAL_RADIO_MODE = os.environ.get(
+    "TEMPORAL_RADIO_MODE",
+    "independent",
+)
+
+TEMPORAL_WINDOW_TTIS = int(
+    os.environ.get(
+        "TEMPORAL_WINDOW_TTIS",
+        "8",
+    )
+)
+
+UT_SPEED_KMH = float(
+    os.environ.get(
+        "UT_SPEED_KMH",
+        "3.0",
+    )
+)
+
+SIM_TTI_DURATION_MS = float(
+    os.environ.get(
+        "SIM_TTI_DURATION_MS",
+        "0.5",
+    )
+)
+
+TEMPORAL_MAX_DISPLACEMENT_M = float(
+    os.environ.get(
+        "TEMPORAL_MAX_DISPLACEMENT_M",
+        "20.0",
+    )
+)
+
+if TEMPORAL_WINDOW_TTIS <= 0:
+    raise ValueError(
+        "TEMPORAL_WINDOW_TTIS must be positive."
+    )
+
+if UT_SPEED_KMH < 0.0:
+    raise ValueError(
+        "UT_SPEED_KMH cannot be negative."
+    )
+
+if SIM_TTI_DURATION_MS <= 0.0:
+    raise ValueError(
+        "SIM_TTI_DURATION_MS must be positive."
+    )
 
 #
 # OPEN-REPRODUCTION ENGINEERING.
@@ -747,7 +1005,7 @@ TEMPORARY SMOKE-RUN CHOICE:
         #     ),
         # )
 
-        manager = TrafficBufferManager(
+        manager = PacketQoSTrafficBufferManager(
             full_buffer_mask=(
                 full_buffer_mask
             ),
@@ -761,6 +1019,24 @@ TEMPORARY SMOKE-RUN CHOICE:
             seed=(
                 SEED
                 + stream_index
+            ),
+
+            packet_qos_enabled=(
+                PACKET_QOS_ENABLE
+            ),
+
+            packet_qos_csv_path=(
+                PACKET_QOS_PATH
+                if PACKET_QOS_ENABLE
+                else None
+            ),
+
+            packet_qos_cell_index=(
+                stream_index
+            ),
+
+            packet_qos_deadline_ttis=(
+                PACKET_QOS_DEADLINE_TTIS
             ),
         )
 
@@ -1063,8 +1339,23 @@ def main() -> None:
     )
 
     print(
-        "Radio temporal model:   independent "
-        "realizations"
+        "Radio temporal mode:    "
+        f"{TEMPORAL_RADIO_MODE}"
+    )
+
+    print(
+        "Temporal window TTIs:   "
+        f"{TEMPORAL_WINDOW_TTIS}"
+    )
+
+    print(
+        "UE speed:               "
+        f"{UT_SPEED_KMH:.1f} km/h"
+    )
+
+    print(
+        "Simulator TTI duration: "
+        f"{SIM_TTI_DURATION_MS:.3f} ms"
     )
 
     print(
@@ -1131,6 +1422,27 @@ def main() -> None:
                     mimo_channel_seed=2000,
 
                     device="cuda:0",
+
+                    ut_speed_kmh=(
+                        UT_SPEED_KMH
+                    ),
+
+                    temporal_radio_mode=(
+                        TEMPORAL_RADIO_MODE
+                    ),
+
+                    temporal_window_ttis=(
+                        TEMPORAL_WINDOW_TTIS
+                    ),
+
+                    tti_duration_s=(
+                        SIM_TTI_DURATION_MS
+                        / 1000.0
+                    ),
+
+                    temporal_max_displacement_m=(
+                        TEMPORAL_MAX_DISPLACEMENT_M
+                    ),
                 )
             )
         )
@@ -1344,10 +1656,109 @@ def main() -> None:
         )
     )
 
+    input_provider = (
+        PhysicalExecutionStressInputProvider(
+            base_provider=(
+                input_provider
+            ),
+
+            config=(
+                PhysicalExecutionStressConfig(
+                    non_serving_interference_power_scale=(
+                        POST_CSI_INTERFERENCE_POWER_SCALE
+                    ),
+
+                    serving_signal_power_scale=(
+                        POST_CSI_SERVING_POWER_SCALE
+                    ),
+
+                    failed_bs_index=(
+                        POST_CSI_FAILED_BS
+                    ),
+                )
+            ),
+        )
+    )
+
+    print(
+        "Scheduler mode:           "
+        f"{SCHEDULER_MODE}"
+    )
+
     print(
         "Candidate intervention:   "
         f"{CANDIDATE_INTERVENTION_MODE}"
     )
+
+    print(
+        "Post-CSI interference x:  "
+        f"{POST_CSI_INTERFERENCE_POWER_SCALE}"
+    )
+
+    print(
+        "Post-CSI serving power x: "
+        f"{POST_CSI_SERVING_POWER_SCALE}"
+    )
+
+    print(
+        "Post-CSI failed BS:       "
+        f"{POST_CSI_FAILED_BS}"
+    )
+
+    # ======================================================
+    # WAVE-5 UE AVAILABILITY
+    # ======================================================
+
+    if UE_AVAILABILITY_SCENARIO_JSON:
+
+        ue_availability_scenario = (
+            parse_ue_availability_scenario_json(
+                UE_AVAILABILITY_SCENARIO_JSON
+            )
+        )
+
+        input_provider = (
+            UEAvailabilityInputProvider(
+                base_provider=input_provider,
+
+                scenario=(
+                    ue_availability_scenario
+                ),
+            )
+        )
+
+        print(
+            "UE availability phases:  "
+            f"{len(ue_availability_scenario.phases)}"
+        )
+
+
+    # ======================================================
+    # WAVE-5 PERSISTENT EXECUTION-TIME NETWORK EVENTS
+    # ======================================================
+
+    if PHYSICAL_NETWORK_SCENARIO_JSON:
+
+        physical_network_scenario = (
+            parse_physical_network_scenario_json(
+                PHYSICAL_NETWORK_SCENARIO_JSON
+            )
+        )
+
+        input_provider = (
+            ScheduledPhysicalExecutionStressInputProvider(
+                base_provider=input_provider,
+
+                scenario=(
+                    physical_network_scenario
+                ),
+            )
+        )
+
+        print(
+            "Physical event phases:   "
+            f"{len(physical_network_scenario.phases)}"
+        )
 
     print(
         "CSI delay TTIs:           "
@@ -1545,6 +1956,52 @@ def main() -> None:
             ),
         )
     )
+
+    runtime_scenario = (
+        RuntimeScenarioController(
+            phases=(
+                parse_runtime_scenario_json(
+                    RUNTIME_SCENARIO_JSON
+                )
+            ),
+            traffic_managers=(
+                traffic_managers
+            ),
+            state_managers=(
+                state_managers
+            ),
+        )
+    )
+
+    service_metrics = RuntimeServiceMetrics(
+        num_cells=(
+            NUM_TRAINING_CELLS
+        )
+    )
+
+    def combined_cell_result_observer(
+        tti_index: int,
+        cell_index: int,
+        cell_result,
+    ) -> None:
+
+        kpi_observer(
+            tti_index,
+            cell_index,
+            cell_result,
+        )
+
+        service_metrics.observe(
+            tti_index=tti_index,
+            cell_index=cell_index,
+            result=cell_result,
+            full_buffer_mask=(
+                traffic_managers[
+                    cell_index
+                ]
+                .full_buffer_mask
+            ),
+        )
 
 
 
@@ -2020,6 +2477,116 @@ def main() -> None:
     # RUN TWO REAL-SIONNA PPO TTIs
     # ==========================================================
 
+    # ======================================================
+    # WAVE-5 EXECUTION / CONTROL-LOOP STRESS
+    # ======================================================
+
+    execution_schedule_transforms = None
+
+    if (
+        EXECUTION_DELAY_TTIS > 0
+        or CONTROL_LOOP_ENABLE
+    ):
+
+        if (
+            globals().get(
+                "SCHEDULER_MODE",
+                "ppo",
+            )
+            != "ppo"
+        ):
+            raise ValueError(
+                "Wave-5 execution-delay/control-loop "
+                "stress is currently implemented for "
+                "frozen PPO evaluation only."
+            )
+
+        controllers = []
+
+        for _ in range(
+            len(
+                traffic_managers
+            )
+        ):
+
+            if EXECUTION_DELAY_TTIS > 0:
+
+                controller = (
+                    CandidateGatedDelayedPPOExecutionController(
+                        delay_ttis=(
+                            EXECUTION_DELAY_TTIS
+                        ),
+
+                        num_user_slots=(
+                            NUM_USER_SLOTS
+                        ),
+
+                        num_rbgs=(
+                            NUM_RBGS
+                        ),
+
+                        device=DEVICE,
+                    )
+                )
+
+            else:
+
+                controller = (
+                    CandidateGatedControlLoopPPOExecutionController(
+                        config=(
+                            ControlLoopTimingConfig(
+                                deadline_ms=(
+                                    CONTROL_DEADLINE_MS
+                                ),
+
+                                base_compute_ms=(
+                                    CONTROL_BASE_COMPUTE_MS
+                                ),
+
+                                jitter_std_ms=(
+                                    CONTROL_JITTER_STD_MS
+                                ),
+
+                                miss_policy=(
+                                    CONTROL_MISS_POLICY
+                                ),
+
+                                seed=(
+                                    SEED
+                                ),
+                            )
+                        ),
+
+                        num_user_slots=(
+                            NUM_USER_SLOTS
+                        ),
+
+                        num_rbgs=(
+                            NUM_RBGS
+                        ),
+
+                        device=DEVICE,
+                    )
+                )
+
+            controllers.append(
+                controller
+            )
+
+        execution_schedule_transforms = tuple(
+            controllers
+        )
+
+        print(
+            "Execution delay TTIs:    "
+            f"{EXECUTION_DELAY_TTIS}"
+        )
+
+        print(
+            "Control-loop model:      "
+            f"{'enabled' if CONTROL_LOOP_ENABLE else 'disabled'}"
+        )
+
     total_start = (
         time.perf_counter()
     )
@@ -2031,6 +2598,7 @@ def main() -> None:
 
     metrics_fieldnames = [
         "tti",
+        "scheduler_mode",
         "elapsed_s",
         "peak_gpu_mib",
         "buffer_size",
@@ -2042,6 +2610,8 @@ def main() -> None:
         "mean_td_rate_mbps",
         "mean_wideband_cqi",
         *CANDIDATE_AGGREGATE_FIELDS,
+        "scenario_phase",
+        *SERVICE_AGGREGATE_FIELDS,
         "actor_norm",
         "critic_norm",
         "actor_loss",
@@ -2081,9 +2651,33 @@ def main() -> None:
 
         writer.writeheader()
 
+    service_fieldnames = [
+        "tti",
+        "cell_index",
+        *SERVICE_CELL_FIELDS,
+    ]
+
+    with SERVICE_METRICS_PATH.open(
+        "w",
+        newline="",
+    ) as service_file:
+
+        writer = csv.DictWriter(
+            service_file,
+            fieldnames=(
+                service_fieldnames
+            ),
+        )
+
+        writer.writeheader()
+
     for tti_index in range(
         NUM_TTIS
     ):
+
+        runtime_scenario.apply_tti(
+            tti_index
+        )
         updates_before = (
             centralized_training
             .num_updates
@@ -2106,131 +2700,191 @@ def main() -> None:
             time.perf_counter()
         )
 
-        result = run_multicell_ppo_training(
-            start_tti_index=(
-                tti_index
-            ),
+        if SCHEDULER_MODE == "ppo":
 
-            #
-            # One TTI at a time only so we can
-            # inspect boundary behavior.
-            #
-            num_ttis=1,
-
-            input_provider=(
-                input_provider
-            ),
-
-            traffic_managers=(
-                traffic_managers
-            ),
-
-            state_managers=(
-                state_managers
-            ),
-
-            rollout_controllers=(
-                rollout_controllers
-            ),
-
-            actor=actor,
-
-            critic=critic,
-
-            optimizers=optimizers,
-
-            centralized_training=(
-                centralized_training
-            ),
-
-            tds_eligibility_config=(
-                TDSBufferEligibilityConfig(
-                    mode=(
-                        "data_available_only"
-                    ),
-                )
-            ),
-
-            state_config=(
-                state_config
-            ),
-
-            greedy_config=(
-                PPOGreedySearchConfig()
-            ),
-
-            reward_config=(
-                PPORewardConfig(
-                    geometric_mean_normalizer_bps=(
-                        GEOMETRIC_MEAN_NORMALIZER_BPS
-                    ),
-                )
-            ),
-
-            #
-            # PRIMARY CURRENT REPRODUCTION
-            # INTERPRETATION.
-            #
-            reward_population=(
-                "candidates"
-            ),
-
-            #
-            # TEST-SCALE ONLY.
-            #
-            # Paper:
-            #     TTIs 0..99 warm up
-            #     collection starts at 100.
-            #
-            # We collect from TTI 0 only so this
-            # two-TTI integration run can prove that
-            # an optimizer update really occurs.
-            #
-            # runner_config=(
-            #     PPOTrainingRunnerConfig(
-            #         first_collection_tti_index=0,
-            #     )
-            # ),
-
-            runner_config=(
-                PPOTrainingRunnerConfig(
-                    first_collection_tti_index=(
-                        FIRST_COLLECTION_TTI_INDEX
-                    ),
-                )
-            ),
-
-            #
-            # Teacher 2 disabled at this stage.
-            #
-            expert_buffer=(
-                expert_buffer
-            ),
-
-            pf_expert_config=(
-                PPOPFExpertConfig()
-            ),
-
-            expert_candidate_augmentation_config=(
-                augmentation_config
-            ),
-
-            expert_candidate_augmentation_generator=(
-                expert_augmentation_generator
-            ),
-
-            reward_reduction="mean",
-
-            preparation_observer=(
-                candidate_preparation_observer
+            result = run_multicell_ppo_training(
+                start_tti_index=(
+                    tti_index
+                ),
+    
+                #
+                # One TTI at a time only so we can
+                # inspect boundary behavior.
+                #
+                num_ttis=1,
+    
+                input_provider=(
+                    input_provider
+                ),
+    
+                traffic_managers=(
+                    traffic_managers
+                ),
+    
+                state_managers=(
+                    state_managers
+                ),
+    
+                rollout_controllers=(
+                    rollout_controllers
+                ),
+    
+                actor=actor,
+    
+                critic=critic,
+    
+                optimizers=optimizers,
+    
+                centralized_training=(
+                    centralized_training
+                ),
+    
+                tds_eligibility_config=(
+                    TDSBufferEligibilityConfig(
+                        mode=(
+                            "data_available_only"
+                        ),
+                    )
+                ),
+    
+                state_config=(
+                    state_config
+                ),
+    
+                greedy_config=(
+                    PPOGreedySearchConfig()
+                ),
+    
+                reward_config=(
+                    PPORewardConfig(
+                        geometric_mean_normalizer_bps=(
+                            GEOMETRIC_MEAN_NORMALIZER_BPS
+                        ),
+                    )
+                ),
+    
+                #
+                # PRIMARY CURRENT REPRODUCTION
+                # INTERPRETATION.
+                #
+                reward_population=(
+                    "candidates"
+                ),
+    
+                #
+                # TEST-SCALE ONLY.
+                #
+                # Paper:
+                #     TTIs 0..99 warm up
+                #     collection starts at 100.
+                #
+                # We collect from TTI 0 only so this
+                # two-TTI integration run can prove that
+                # an optimizer update really occurs.
+                #
+                # runner_config=(
+                #     PPOTrainingRunnerConfig(
+                #         first_collection_tti_index=0,
+                #     )
+                # ),
+    
+                runner_config=(
+                    PPOTrainingRunnerConfig(
+                        first_collection_tti_index=(
+                            FIRST_COLLECTION_TTI_INDEX
+                        ),
+                    )
+                ),
+    
+                #
+                # Teacher 2 disabled at this stage.
+                #
+                expert_buffer=(
+                    expert_buffer
+                ),
+    
+                pf_expert_config=(
+                    PPOPFExpertConfig()
+                ),
+    
+                expert_candidate_augmentation_config=(
+                    augmentation_config
+                ),
+    
+                expert_candidate_augmentation_generator=(
+                    expert_augmentation_generator
+                ),
+    
+                reward_reduction="mean",
+    
+                preparation_observer=(
+                    candidate_preparation_observer
+                ),
+    
+                execution_schedule_transforms=(
+                execution_schedule_transforms
             ),
 
             cell_result_observer=(
-                kpi_observer
-            ),
+                    combined_cell_result_observer
+                ),
+    
+                device=DEVICE,
+            )
 
-            device=DEVICE,
-        )
+        else:
+
+            result = (
+                run_multicell_classical_evaluation(
+                    start_tti_index=(
+                        tti_index
+                    ),
+
+                    num_ttis=1,
+
+                    mode=(
+                        SCHEDULER_MODE
+                    ),
+
+                    input_provider=(
+                        input_provider
+                    ),
+
+                    traffic_managers=(
+                        traffic_managers
+                    ),
+
+                    state_managers=(
+                        state_managers
+                    ),
+
+                    tds_eligibility_config=(
+                        TDSBufferEligibilityConfig(
+                            mode=(
+                                "data_available_only"
+                            ),
+                        )
+                    ),
+
+                    state_config=(
+                        state_config
+                    ),
+
+                    num_user_slots=(
+                        NUM_USER_SLOTS
+                    ),
+
+                    preparation_observer=(
+                        candidate_preparation_observer
+                    ),
+
+                    cell_result_observer=(
+                        combined_cell_result_observer
+                    ),
+
+                    device=DEVICE,
+                )
+            )
 
         torch.cuda.synchronize(
             DEVICE
@@ -2333,6 +2987,55 @@ def main() -> None:
             writer.writerows(
                 candidate_rows
             )
+
+        service_rows = (
+            service_metrics
+            .pop_tti_rows(
+                tti_index
+            )
+        )
+
+        service_summary = (
+            aggregate_service_rows(
+                service_rows
+            )
+        )
+
+        with SERVICE_METRICS_PATH.open(
+            "a",
+            newline="",
+        ) as service_file:
+
+            writer = csv.DictWriter(
+                service_file,
+                fieldnames=(
+                    service_fieldnames
+                ),
+            )
+
+            writer.writerows(
+                service_rows
+            )
+
+        print(
+            "  scenario phase:       "
+            f"{runtime_scenario.current_phase_name}"
+        )
+
+        print(
+            "  queue P95 bits:       "
+            f"{service_summary['queue_p95_bits_mean']:.1f}"
+        )
+
+        print(
+            "  starvation fraction:  "
+            f"{service_summary['starvation_fraction_mean']:.4f}"
+        )
+
+        print(
+            "  max no-service streak:"
+            f" {service_summary['no_service_streak_max_mean']:.2f}"
+        )
 
         print(
             "  stream-0 mean TD rate:"
@@ -2631,6 +3334,7 @@ def main() -> None:
 
         metrics_row = {
             "tti": tti_index,
+            "scheduler_mode": SCHEDULER_MODE,
             "elapsed_s": elapsed,
             "peak_gpu_mib": peak_memory_mib,
             "buffer_size": (
@@ -2659,6 +3363,13 @@ def main() -> None:
             ),
 
             **candidate_summary,
+
+            "scenario_phase": (
+                runtime_scenario
+                .current_phase_name
+            ),
+
+            **service_summary,
 
             "actor_norm": (
                 current_actor_norm
@@ -3245,6 +3956,11 @@ def main() -> None:
     print(
         "Candidate metrics CSV:   "
         f"{CANDIDATE_METRICS_PATH}"
+    )
+
+    print(
+        "Service metrics CSV:     "
+        f"{SERVICE_METRICS_PATH}"
     )
 
     print(
