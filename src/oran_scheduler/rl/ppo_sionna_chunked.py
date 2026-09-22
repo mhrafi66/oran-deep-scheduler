@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
@@ -126,6 +127,23 @@ class ChunkedSionnaPPOConfig:
     #
     ue_microbatch_size: int = 2
 
+    #
+    # WAVE-6 DYNAMIC ASSOCIATION.
+    #
+    # False:
+    #     preserve the existing cell/microbatch RNG
+    #     behavior exactly.
+    #
+    # True:
+    #     require ue_microbatch_size == 1 and key
+    #     radio RNG by persistent GLOBAL UE identity.
+    #
+    # This prevents handover from changing a UE's
+    # random channel process merely because its
+    # serving cell or local slot changed.
+    #
+    identity_stable_ue_channel_rng: bool = False
+
     topology_seed: int = 42
 
     association_channel_seed: int = 1000
@@ -203,6 +221,15 @@ class ChunkedSionnaPPOConfig:
         if self.ue_microbatch_size <= 0:
             raise ValueError(
                 "ue_microbatch_size must be positive."
+            )
+
+        if (
+            self.identity_stable_ue_channel_rng
+            and self.ue_microbatch_size != 1
+        ):
+            raise ValueError(
+                "identity-stable UE channel RNG "
+                "requires ue_microbatch_size=1."
             )
 
 
@@ -891,6 +918,98 @@ def _temporal_microbatch_channel_seed(
     )
 
 
+
+
+def _identity_stable_independent_ue_seed(
+    *,
+    context: ChunkedSionnaPPOContext,
+    tti_index: int,
+    global_ue_index: int,
+) -> int:
+    """
+    Independent-radio seed owned by GLOBAL UE identity.
+
+    Association/local scheduler position does not
+    enter this seed.
+    """
+
+    if tti_index < 0:
+        raise ValueError(
+            "tti_index must be non-negative."
+        )
+
+    if not (
+        0
+        <= global_ue_index
+        < context.num_global_ues
+    ):
+        raise ValueError(
+            "global_ue_index outside topology."
+        )
+
+    seed_stride = (
+        context.num_global_ues
+        + 1
+    )
+
+    return int(
+        context
+        .config
+        .mimo_channel_seed
+
+        + tti_index
+        * seed_stride
+
+        + global_ue_index
+    )
+
+
+def _identity_stable_temporal_ue_seed(
+    *,
+    context: ChunkedSionnaPPOContext,
+    window_index: int,
+    global_ue_index: int,
+) -> int:
+    """
+    Temporal-window seed owned by GLOBAL UE identity.
+
+    Every TTI within one temporal window addresses
+    the same underlying Sionna realization.
+
+    A handover does not change this seed.
+    """
+
+    if window_index < 0:
+        raise ValueError(
+            "window_index must be non-negative."
+        )
+
+    if not (
+        0
+        <= global_ue_index
+        < context.num_global_ues
+    ):
+        raise ValueError(
+            "global_ue_index outside topology."
+        )
+
+    seed_stride = (
+        context.num_global_ues
+        + 1
+    )
+
+    return int(
+        context
+        .config
+        .mimo_channel_seed
+
+        + window_index
+        * seed_stride
+
+        + global_ue_index
+    )
+
+
 def _generate_microbatch_h_freq(
     *,
     context: ChunkedSionnaPPOContext,
@@ -942,6 +1061,34 @@ def _generate_microbatch_h_freq(
         .temporal_radio_mode
     )
 
+    identity_stable = bool(
+        getattr(
+            context.config,
+            "identity_stable_ue_channel_rng",
+            False,
+        )
+    )
+
+    identity_global_ue = None
+
+    if identity_stable:
+
+        if int(
+            microbatch_global_ue_indices
+            .numel()
+        ) != 1:
+            raise ValueError(
+                "Identity-stable radio generation "
+                "requires exactly one UE per "
+                "microbatch."
+            )
+
+        identity_global_ue = int(
+            microbatch_global_ue_indices[
+                0
+            ].item()
+        )
+
     if mode == "independent":
 
         microbatch_topology = (
@@ -954,21 +1101,42 @@ def _generate_microbatch_h_freq(
             )
         )
 
-        channel_seed = (
-            _microbatch_channel_seed(
-                context=context,
+        if identity_stable:
 
-                tti_index=tti_index,
-
-                real_cell_index=(
-                    real_cell_index
-                ),
-
-                microbatch_index=(
-                    microbatch_index
-                ),
+            assert (
+                identity_global_ue
+                is not None
             )
-        )
+
+            channel_seed = (
+                _identity_stable_independent_ue_seed(
+                    context=context,
+
+                    tti_index=tti_index,
+
+                    global_ue_index=(
+                        identity_global_ue
+                    ),
+                )
+            )
+
+        else:
+
+            channel_seed = (
+                _microbatch_channel_seed(
+                    context=context,
+
+                    tti_index=tti_index,
+
+                    real_cell_index=(
+                        real_cell_index
+                    ),
+
+                    microbatch_index=(
+                        microbatch_index
+                    ),
+                )
+            )
 
         channel = (
             context
@@ -1086,21 +1254,42 @@ def _generate_microbatch_h_freq(
         )
 
 
-    channel_seed = (
-        _temporal_microbatch_channel_seed(
-            context=context,
+    if identity_stable:
 
-            window_index=window_index,
-
-            real_cell_index=(
-                real_cell_index
-            ),
-
-            microbatch_index=(
-                microbatch_index
-            ),
+        assert (
+            identity_global_ue
+            is not None
         )
-    )
+
+        channel_seed = (
+            _identity_stable_temporal_ue_seed(
+                context=context,
+
+                window_index=window_index,
+
+                global_ue_index=(
+                    identity_global_ue
+                ),
+            )
+        )
+
+    else:
+
+        channel_seed = (
+            _temporal_microbatch_channel_seed(
+                context=context,
+
+                window_index=window_index,
+
+                real_cell_index=(
+                    real_cell_index
+                ),
+
+                microbatch_index=(
+                    microbatch_index
+                ),
+            )
+        )
 
 
     #
@@ -2760,6 +2949,10 @@ def _build_cell_training_inputs(
     context: ChunkedSionnaPPOContext,
     tti_index: int,
     stream_index: int,
+
+    cell_global_ue_indices_override: (
+        torch.Tensor | None
+    ) = None,
 ) -> PPOTrainingTTIInputs:
     """
     Build one PPO stream's real Sionna inputs.
@@ -2800,12 +2993,99 @@ def _build_cell_training_inputs(
         ]
     )
 
-    cell_global_ue_indices = (
-        context
-        .global_ue_indices_by_stream[
-            stream_index
-        ]
-    )
+    if (
+        cell_global_ue_indices_override
+        is None
+    ):
+
+        cell_global_ue_indices = (
+            context
+            .global_ue_indices_by_stream[
+                stream_index
+            ]
+        )
+
+    else:
+
+        cell_global_ue_indices = (
+            cell_global_ue_indices_override
+        )
+
+        if (
+            cell_global_ue_indices.ndim
+            != 1
+        ):
+            raise ValueError(
+                "Dynamic cell UE membership must "
+                "have shape [UE]."
+            )
+
+        if (
+            cell_global_ue_indices.dtype
+            == torch.bool
+            or torch.is_floating_point(
+                cell_global_ue_indices
+            )
+        ):
+            raise ValueError(
+                "Dynamic cell UE identities must "
+                "use an integer dtype."
+            )
+
+        if (
+            cell_global_ue_indices.device
+            != context.topology.ut_loc.device
+        ):
+            raise ValueError(
+                "Dynamic cell UE identities are "
+                "on the wrong device."
+            )
+
+        if int(
+            cell_global_ue_indices.numel()
+        ) == 0:
+            raise ValueError(
+                "Dynamic selected cell has zero "
+                "serving UEs. Empty-cell scheduler "
+                "support is not implemented yet."
+            )
+
+        if torch.any(
+            cell_global_ue_indices < 0
+        ):
+            raise ValueError(
+                "Dynamic cell UE identities cannot "
+                "be negative."
+            )
+
+        if torch.any(
+            cell_global_ue_indices
+            >= context.num_global_ues
+        ):
+            raise ValueError(
+                "Dynamic cell UE identity outside "
+                "global topology."
+            )
+
+        if (
+            torch.unique(
+                cell_global_ue_indices
+            ).numel()
+            != cell_global_ue_indices.numel()
+        ):
+            raise ValueError(
+                "Dynamic cell UE identities must "
+                "be unique."
+            )
+
+        cell_global_ue_indices = (
+            cell_global_ue_indices
+            .detach()
+            .clone()
+            .to(
+                dtype=torch.long,
+            )
+        )
 
     microbatch_specs = (
         _partition_cell_global_ue_indices(
@@ -3458,8 +3738,57 @@ class CellChunkedSionnaPPOInputProvider:
         self,
         *,
         context: ChunkedSionnaPPOContext,
+
+        global_ue_indices_provider: (
+            Callable[
+                [
+                    int,
+                    int,
+                ],
+                torch.Tensor,
+            ]
+            | None
+        ) = None,
     ) -> None:
         self.context = context
+
+        self.global_ue_indices_provider = (
+            global_ue_indices_provider
+        )
+
+        #
+        # Production dynamic membership must use
+        # identity-stable channel RNG.
+        #
+        # Minimal fake contexts in unit tests may not
+        # expose config, so enforce this only when a
+        # real config object is available.
+        #
+        if (
+            global_ue_indices_provider
+            is not None
+        ):
+            config = getattr(
+                context,
+                "config",
+                None,
+            )
+
+            if (
+                config is not None
+                and not bool(
+                    getattr(
+                        config,
+                        "identity_stable_ue_channel_rng",
+                        False,
+                    )
+                )
+            ):
+                raise ValueError(
+                    "Dynamic Sionna membership "
+                    "requires identity-stable "
+                    "UE channel RNG."
+                )
 
         self._current_tti_index: (
             int | None
@@ -3688,13 +4017,44 @@ class CellChunkedSionnaPPOInputProvider:
             "radio.cell_input_total",
             device=profile_device,
         ):
-            inputs = (
-                _build_cell_training_inputs(
-                    context=self.context,
-                    tti_index=tti_index,
-                    stream_index=stream_index,
+
+            if (
+                self.global_ue_indices_provider
+                is None
+            ):
+
+                #
+                # Preserve the original static path.
+                #
+                inputs = (
+                    _build_cell_training_inputs(
+                        context=self.context,
+                        tti_index=tti_index,
+                        stream_index=stream_index,
+                    )
                 )
-            )
+
+            else:
+
+                dynamic_global_ue_indices = (
+                    self
+                    .global_ue_indices_provider(
+                        tti_index,
+                        stream_index,
+                    )
+                )
+
+                inputs = (
+                    _build_cell_training_inputs(
+                        context=self.context,
+                        tti_index=tti_index,
+                        stream_index=stream_index,
+
+                        cell_global_ue_indices_override=(
+                            dynamic_global_ue_indices
+                        ),
+                    )
+                )
 
         self._current_inputs_by_stream[
             stream_index
