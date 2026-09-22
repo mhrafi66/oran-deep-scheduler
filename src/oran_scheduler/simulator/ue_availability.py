@@ -345,11 +345,28 @@ def parse_ue_availability_scenario_json(
 
 class UEAvailabilityInputProvider:
     """
-    Remove temporarily unavailable UEs from the
-    scheduler-facing valid mask.
+    Temporarily remove UEs from PF-TDS scheduling
+    eligibility WITHOUT changing association.
 
-    Current PHY builder remains candidate driven, so
-    invalid UEs cannot enter PF-TDS/candidate PHY.
+    Important separation:
+
+        observation.serving_ue_valid_mask
+            =
+        persistent association / padded UE layout
+
+        tds_eligibility_override_mask
+            =
+        temporary per-TTI schedulability
+
+    Therefore an unavailable UE remains attached to
+    the same cell, retains its traffic queue and PF
+    history, but cannot enter PF-TDS while the
+    availability gate is false.
+
+    Traffic arrivals continue while unavailable, so
+    finite-buffer backlog may accumulate.
+
+    This is NOT handover or reassociation.
     """
 
     def __init__(
@@ -401,47 +418,35 @@ class UEAvailabilityInputProvider:
             )
         )
 
-        new_valid = (
+        availability_gate = (
             observation
             .serving_ue_valid_mask
             & (~unavailable)
         )
 
-        new_observation = replace(
-            observation,
-            serving_ue_valid_mask=(
-                new_valid
-            ),
-        )
-
-        packet_arrivals = (
-            base.packet_arrivals
-        )
-
         #
-        # Deterministic replay traces can be masked
-        # exactly. When packet_arrivals is None the
-        # TrafficBufferManager samples normally,
-        # allowing backlog to build during temporary
-        # unavailability.
+        # CRITICAL SEMANTIC SEPARATION
+        # ----------------------------
         #
-        if packet_arrivals is not None:
-
-            packet_arrivals = (
-                packet_arrivals
-                .clone()
-            )
-
-            packet_arrivals[
-                unavailable
-            ] = 0
-
+        # Do NOT modify:
+        #
+        #     observation.serving_ue_valid_mask
+        #
+        # That mask describes the persistent serving
+        # layout/association and is intentionally
+        # required to remain constant by the
+        # OneLDSCellTTIStateManager.
+        #
+        # Temporary availability is instead carried
+        # as a separate TDS eligibility gate.
+        #
+        # Also preserve packet_arrivals unchanged:
+        # traffic may continue entering the queue
+        # while a UE is temporarily unavailable.
+        #
         return replace(
             base,
-            observation=(
-                new_observation
-            ),
-            packet_arrivals=(
-                packet_arrivals
+            tds_eligibility_override_mask=(
+                availability_gate
             ),
         )

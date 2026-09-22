@@ -517,6 +517,117 @@ def _validate_physical_inputs(
         )
 
 
+def _apply_tds_eligibility_override(
+    *,
+    eligibility: TDSEligibilityData,
+    override_mask: torch.Tensor | None,
+) -> TDSEligibilityData:
+    """
+    Apply an external temporary scheduling gate.
+
+    Association validity remains unchanged.
+
+    The override can only REMOVE UEs from the
+    normal PF-TDS eligible population.
+
+    Intended examples:
+        - temporary UE unavailability
+        - admission/control gating
+        - transient scheduler-side exclusion
+
+    This is NOT reassociation.
+    """
+
+    if override_mask is None:
+        return eligibility
+
+    reference_mask = (
+        eligibility
+        .serving_ue_valid_mask
+    )
+
+    if tuple(
+        override_mask.shape
+    ) != tuple(
+        reference_mask.shape
+    ):
+        raise ValueError(
+            "tds_eligibility_override_mask must "
+            "match serving-UE layout."
+        )
+
+    if (
+        override_mask.dtype
+        != torch.bool
+    ):
+        raise ValueError(
+            "tds_eligibility_override_mask must "
+            "use torch.bool."
+        )
+
+    if (
+        override_mask.device
+        != reference_mask.device
+    ):
+        raise ValueError(
+            "tds_eligibility_override_mask is "
+            "on the wrong device."
+        )
+
+    #
+    # The environment may temporarily disable
+    # associated UEs, but it may never convert
+    # padding/non-associated slots into real UEs.
+    #
+    if torch.any(
+        override_mask
+        & ~reference_mask
+    ):
+        raise ValueError(
+            "TDS eligibility override cannot "
+            "enable an invalid serving-UE slot."
+        )
+
+    effective_mask = (
+        eligibility
+        .eligible_mask
+        & override_mask
+    )
+
+    return TDSEligibilityData(
+        serving_ue_valid_mask=(
+            eligibility
+            .serving_ue_valid_mask
+            .detach()
+            .clone()
+        ),
+
+        has_finite_buffer_data=(
+            eligibility
+            .has_finite_buffer_data
+            .detach()
+            .clone()
+        ),
+
+        eligible_mask=(
+            effective_mask
+            .detach()
+            .clone()
+        ),
+
+        num_valid_serving_ues=(
+            eligibility
+            .num_valid_serving_ues
+        ),
+
+        num_eligible_ues=int(
+            effective_mask
+            .sum()
+            .item()
+        ),
+    )
+
+
 def prepare_traffic_aware_ppo_cell_tti(
     *,
     tti_index: int,
@@ -534,6 +645,11 @@ def prepare_traffic_aware_ppo_cell_tti(
     packet_arrivals: (
         torch.Tensor | None
     ) = None,
+
+    tds_eligibility_override_mask: (
+        torch.Tensor | None
+    ) = None,
+
     device: str | torch.device = "cuda:0",
 ) -> PreparedTrafficAwarePPOCellTTI:
     """
@@ -623,6 +739,19 @@ def prepare_traffic_aware_ppo_cell_tti(
             tds_eligibility_config
         ),
     )
+
+    tds_eligibility = (
+        _apply_tds_eligibility_override(
+            eligibility=(
+                tds_eligibility
+            ),
+
+            override_mask=(
+                tds_eligibility_override_mask
+            ),
+        )
+    )
+
 
     prepared = state_manager.prepare_tti(
         tti_index=tti_index,
@@ -806,7 +935,15 @@ def run_traffic_aware_ppo_cell_tti_step(
     ) = None,
 
     reward_reduction: PPORewardReduction = "mean",
-    packet_arrivals: torch.Tensor | None = None,
+
+    packet_arrivals: (
+        torch.Tensor | None
+    ) = None,
+
+    tds_eligibility_override_mask: (
+        torch.Tensor | None
+    ) = None,
+
     device: str | torch.device = "cuda:0",
 ) -> TrafficAwarePPOCellTTIStepResult:
     """
@@ -921,6 +1058,11 @@ def run_traffic_aware_ppo_cell_tti_step(
                 packet_arrivals=(
                     packet_arrivals
                 ),
+
+                tds_eligibility_override_mask=(
+                    tds_eligibility_override_mask
+                ),
+
                 device=device,
             )
         )

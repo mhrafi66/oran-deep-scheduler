@@ -46,6 +46,13 @@ from oran_scheduler.simulator.one_lds_cell_tti import (
     OneLDSCellTTIStateManager,
     PreparedOneLDSCellTTI,
 )
+from oran_scheduler.simulator.mobility import (
+    MobilityConfig,
+    build_mobility_snapshot,
+)
+from oran_scheduler.simulator.temporal_channel import (
+    VelocityWindowFrequencyChannelRuntime,
+)
 from oran_scheduler.simulator.topology import (
     TopologyConfig,
     TopologyData,
@@ -143,6 +150,28 @@ class ChunkedSionnaPPOConfig:
 
     ut_speed_kmh: float = 3.0
 
+    # ----------------------------------------------------------
+    # WAVE-4 TEMPORAL RADIO
+    #
+    # independent:
+    #     exact previous behavior
+    #
+    # velocity_window:
+    #     one velocity-driven Sionna temporal
+    #     realization is addressed in windows.
+    #
+    # OPEN-REPRODUCTION:
+    #     simulator scheduling-step duration.
+    # ----------------------------------------------------------
+
+    temporal_radio_mode: str = "independent"
+
+    temporal_window_ttis: int = 8
+
+    tti_duration_s: float = 0.001
+
+    temporal_max_displacement_m: float = 20.0
+
 
     def __post_init__(
         self,
@@ -203,6 +232,37 @@ class ChunkedSionnaPPOConfig:
             )
 
 
+        if self.temporal_radio_mode not in {
+            "independent",
+            "velocity_window",
+        }:
+            raise ValueError(
+                "temporal_radio_mode must be "
+                "'independent' or "
+                "'velocity_window'."
+            )
+
+        if self.temporal_window_ttis <= 0:
+            raise ValueError(
+                "temporal_window_ttis must be "
+                "positive."
+            )
+
+        if self.tti_duration_s <= 0.0:
+            raise ValueError(
+                "tti_duration_s must be positive."
+            )
+
+        if (
+            self.temporal_max_displacement_m
+            <= 0.0
+        ):
+            raise ValueError(
+                "temporal_max_displacement_m "
+                "must be positive."
+            )
+
+
 
 @dataclass(frozen=True)
 class ChunkedSionnaPPOContext:
@@ -257,6 +317,18 @@ class ChunkedSionnaPPOContext:
     # are still supplied for every generation.
     #
     channel_runtime: FrequencyChannelRuntime
+
+    #
+    # None in legacy independent mode.
+    #
+    # In Wave-4 temporal mode this runtime directly
+    # generates multi-TTI velocity-driven Sionna
+    # channel windows.
+    #
+    temporal_channel_runtime: (
+        VelocityWindowFrequencyChannelRuntime
+        | None
+    ) = None
 
 
     @property
@@ -343,15 +415,15 @@ def build_chunked_sionna_ppo_context(
             config.num_ut_per_sector
         ),
 
-        scenario="uma",
+        scenario=config.scenario,
 
-        isd_m=200.0,
+        isd_m=config.isd_m,
 
-        bs_height_m=25.0,
+        bs_height_m=config.bs_height_m,
 
-        ut_height_m=1.5,
+        ut_height_m=config.ut_height_m,
 
-        ut_speed_kmh=3.0,
+        ut_speed_kmh=config.ut_speed_kmh,
 
         seed=config.topology_seed,
 
@@ -645,6 +717,18 @@ def build_chunked_sionna_ppo_context(
         )
     )
 
+    temporal_channel_runtime = None
+
+    if (
+        config.temporal_radio_mode
+        == "velocity_window"
+    ):
+        temporal_channel_runtime = (
+            VelocityWindowFrequencyChannelRuntime(
+                config=paper_channel_config
+            )
+        )
+
     return ChunkedSionnaPPOContext(
         config=config,
 
@@ -681,6 +765,380 @@ def build_chunked_sionna_ppo_context(
         channel_runtime=(
             channel_runtime
         ),
+
+        temporal_channel_runtime=(
+            temporal_channel_runtime
+        ),
+    )
+
+
+
+def _temporal_window_coordinates(
+    *,
+    tti_index: int,
+    window_ttis: int,
+) -> tuple[
+    int,
+    int,
+    int,
+]:
+    """
+    Map absolute TTI ->
+
+        window index,
+        window start TTI,
+        offset inside window.
+
+    Example, W=8:
+
+        t=0  -> (0, 0, 0)
+        t=7  -> (0, 0, 7)
+        t=8  -> (1, 8, 0)
+        t=11 -> (1, 8, 3)
+    """
+
+    if tti_index < 0:
+        raise ValueError(
+            "tti_index must be non-negative."
+        )
+
+    if window_ttis <= 0:
+        raise ValueError(
+            "window_ttis must be positive."
+        )
+
+    window_index = (
+        tti_index
+        // window_ttis
+    )
+
+    window_start_tti = (
+        window_index
+        * window_ttis
+    )
+
+    offset = (
+        tti_index
+        - window_start_tti
+    )
+
+    return (
+        window_index,
+        window_start_tti,
+        offset,
+    )
+
+
+def _temporal_microbatch_channel_seed(
+    *,
+    context: ChunkedSionnaPPOContext,
+    window_index: int,
+    real_cell_index: int,
+    microbatch_index: int,
+) -> int:
+    """
+    Deterministic seed shared by every TTI inside
+    one temporal radio window.
+
+    This is the critical difference from the old
+    independent realization path.
+
+    Old:
+        seed depends on TTI.
+
+    New:
+        seed depends on temporal WINDOW.
+
+    Therefore offsets 0..W-1 address time samples
+    from the same Sionna realization.
+    """
+
+    if window_index < 0:
+        raise ValueError(
+            "window_index must be non-negative."
+        )
+
+    if not (
+        0
+        <= real_cell_index
+        < context.num_cells
+    ):
+        raise ValueError(
+            "real_cell_index outside topology."
+        )
+
+    if microbatch_index < 0:
+        raise ValueError(
+            "microbatch_index must be non-negative."
+        )
+
+    seed_stride = (
+        context.num_global_ues
+        + 1
+    )
+
+    window_cell_ordinal = (
+        window_index
+        * context.num_cells
+        + real_cell_index
+    )
+
+    return int(
+        context.config.mimo_channel_seed
+        + window_cell_ordinal
+        * seed_stride
+        + microbatch_index
+    )
+
+
+def _generate_microbatch_h_freq(
+    *,
+    context: ChunkedSionnaPPOContext,
+    tti_index: int,
+    real_cell_index: int,
+    microbatch_index: int,
+    microbatch_global_ue_indices: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Generate exactly one TTI-shaped paper-MIMO H.
+
+    Returned shape is identical in BOTH modes:
+
+        [
+            batch,
+            microbatch UE,
+            RX,
+            all 21 BS,
+            TX,
+            1 time sample,
+            subcarrier,
+        ]
+
+    Modes
+    -----
+
+    independent:
+        Preserve the original implementation exactly.
+
+    velocity_window:
+        1. Find this TTI's temporal window.
+        2. Move UE geometry to the START of the window.
+        3. Generate W velocity-driven Sionna samples.
+        4. Return only the current TTI offset.
+
+    MEMORY POLICY
+    -------------
+    Production generates W correlated CIR samples,
+    selects the requested CIR time sample, and only
+    then performs OFDM/subcarrier expansion.
+
+    The complete W-sample paper-MIMO frequency tensor
+    is never materialized in this path.
+    """
+
+    mode = (
+        context
+        .config
+        .temporal_radio_mode
+    )
+
+    if mode == "independent":
+
+        microbatch_topology = (
+            subset_topology_ues(
+                topology=context.topology,
+
+                global_ue_indices=(
+                    microbatch_global_ue_indices
+                ),
+            )
+        )
+
+        channel_seed = (
+            _microbatch_channel_seed(
+                context=context,
+
+                tti_index=tti_index,
+
+                real_cell_index=(
+                    real_cell_index
+                ),
+
+                microbatch_index=(
+                    microbatch_index
+                ),
+            )
+        )
+
+        channel = (
+            context
+            .channel_runtime
+            .generate(
+                topology=(
+                    microbatch_topology
+                ),
+
+                seed=channel_seed,
+
+                batch_size=(
+                    context
+                    .topology_config
+                    .batch_size
+                ),
+            )
+        )
+
+        return channel.h_freq
+
+
+    if mode != "velocity_window":
+        raise RuntimeError(
+            "Unexpected temporal radio mode."
+        )
+
+
+    (
+        window_index,
+        window_start_tti,
+        offset,
+    ) = _temporal_window_coordinates(
+        tti_index=tti_index,
+
+        window_ttis=(
+            context
+            .config
+            .temporal_window_ttis
+        ),
+    )
+
+
+    #
+    # Move persistent UE geometry only to the
+    # beginning of the radio window.
+    #
+    # Sionna velocity then evolves the fast channel
+    # samples INSIDE that short window.
+    #
+    mobility_snapshot = (
+        build_mobility_snapshot(
+            initial_topology=(
+                context.topology
+            ),
+
+            config=MobilityConfig(
+                tti_duration_s=(
+                    context
+                    .config
+                    .tti_duration_s
+                ),
+
+                trajectory_mode=(
+                    "static"
+                    if (
+                        context
+                        .config
+                        .ut_speed_kmh
+                        == 0.0
+                    )
+                    else
+                    "constant_velocity"
+                ),
+
+                association_mode="fixed",
+
+                max_horizontal_displacement_m=(
+                    context
+                    .config
+                    .temporal_max_displacement_m
+                ),
+            ),
+
+            tti_index=(
+                window_start_tti
+            ),
+        )
+    )
+
+
+    microbatch_topology = (
+        subset_topology_ues(
+            topology=(
+                mobility_snapshot
+                .topology
+            ),
+
+            global_ue_indices=(
+                microbatch_global_ue_indices
+            ),
+        )
+    )
+
+
+    runtime = (
+        context
+        .temporal_channel_runtime
+    )
+
+    if runtime is None:
+        raise RuntimeError(
+            "velocity_window mode requires "
+            "temporal_channel_runtime."
+        )
+
+
+    channel_seed = (
+        _temporal_microbatch_channel_seed(
+            context=context,
+
+            window_index=window_index,
+
+            real_cell_index=(
+                real_cell_index
+            ),
+
+            microbatch_index=(
+                microbatch_index
+            ),
+        )
+    )
+
+
+    #
+    # MEMORY-SAFE TEMPORAL PATH
+    # -------------------------
+    #
+    # Generate the complete W-sample correlated CIR
+    # realization, but select the requested temporal
+    # coefficient BEFORE OFDM/subcarrier expansion.
+    #
+    # Therefore the production scheduler never
+    # materializes a W-sample full paper-MIMO
+    # frequency tensor merely to consume one TTI.
+    #
+    return runtime.generate_tti_slice(
+        topology=microbatch_topology,
+
+        seed=channel_seed,
+
+        batch_size=(
+            context
+            .topology_config
+            .batch_size
+        ),
+
+        num_ttis=(
+            context
+            .config
+            .temporal_window_ttis
+        ),
+
+        tti_duration_s=(
+            context
+            .config
+            .tti_duration_s
+        ),
+
+        tti_offset=offset,
     )
 
 
@@ -2385,150 +2843,29 @@ def _build_cell_training_inputs(
     ) in enumerate(
         microbatch_specs
     ):
-        microbatch_topology = (
-            subset_topology_ues(
-                topology=context.topology,
-
-                global_ue_indices=(
-                    microbatch_global_ue_indices
-                ),
-            )
-        )
-
-        channel_seed = (
-            _microbatch_channel_seed(
-                context=context,
-
-                tti_index=(
-                    tti_index
-                ),
-
-                real_cell_index=(
-                    real_cell_index
-                ),
-
-                microbatch_index=(
-                    microbatch_index
-                ),
-            )
-        )
-
-        # channel_config = ChannelConfig(
-        #     carrier_frequency_hz=4.0e9,
-
-        #     subcarrier_spacing_hz=30.0e3,
-
-        #     num_rbs=(
-        #         context.config.num_rbs
-        #     ),
-
-        #     subcarriers_per_rb=(
-        #         context
-        #         .config
-        #         .subcarriers_per_rb
-        #     ),
-
-        #     num_ofdm_symbols=1,
-
-        #     antenna_mode="paper",
-
-        #     direction="downlink",
-
-        #     o2i_model="low",
-
-        #     enable_pathloss=True,
-
-        #     enable_shadow_fading=True,
-
-        #     precision="single",
-
-        #     device=(
-        #         context.config.device
-        #     ),
-
-        #     seed=channel_seed,
-        # )
-
-        # channel = (
-        #     generate_frequency_channel(
-        #         topology=(
-        #             microbatch_topology
-        #         ),
-
-        #         topology_config=(
-        #             context.topology_config
-        #         ),
-
-        #         channel_config=(
-        #             channel_config
-        #         ),
-        #     )
-        # )
-
-        # ======================================================
-        # PERSISTENT SIONNA RADIO GENERATION
-        # ======================================================
-        #
-        # The topology and RNG seed remain unique to
-        # this exact:
-        #
-        #     TTI
-        #     real cell
-        #     UE microbatch
-        #
-        # but the expensive configuration-invariant
-        # Sionna objects are reused.
-        #
-
-        # channel = (
-        #     context
-        #     .channel_runtime
-        #     .generate(
-        #         topology=(
-        #             microbatch_topology
-        #         ),
-
-        #         seed=(
-        #             channel_seed
-        #         ),
-
-        #         batch_size=(
-        #             context
-        #             .topology_config
-        #             .batch_size
-        #         ),
-        #     )
-        # )
-
         with perf_region(
             "radio.channel_generation",
             device=context.config.device,
         ):
-            channel = (
-                context
-                .channel_runtime
-                .generate(
-                    topology=(
-                        microbatch_topology
+            h_freq = (
+                _generate_microbatch_h_freq(
+                    context=context,
+
+                    tti_index=tti_index,
+
+                    real_cell_index=(
+                        real_cell_index
                     ),
-                    seed=(
-                        channel_seed
+
+                    microbatch_index=(
+                        microbatch_index
                     ),
-                    batch_size=(
-                        context
-                        .topology_config
-                        .batch_size
+
+                    microbatch_global_ue_indices=(
+                        microbatch_global_ue_indices
                     ),
                 )
             )
-
-        #
-        # This H is intentionally retained.
-        #
-        # The rest of ChannelData/Sionna's model
-        # should NOT survive this microbatch.
-        #
-        h_freq = channel.h_freq
 
         num_microbatch_ues = int(
             h_freq.shape[1]
@@ -2920,10 +3257,14 @@ def _build_cell_training_inputs(
 
         del local_serving_bs
 
-        del channel
-
-        del microbatch_topology
-
+        #
+        # channel and microbatch_topology now live
+        # inside _generate_microbatch_h_freq().
+        #
+        # They leave scope automatically when that
+        # helper returns, so there is nothing to
+        # delete here.
+        #
         del h_freq
 
     microbatches = tuple(

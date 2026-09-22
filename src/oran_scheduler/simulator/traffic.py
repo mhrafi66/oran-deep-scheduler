@@ -342,6 +342,103 @@ class TrafficBufferManager:
         ) = None
 
 
+    def reset_ftp_buffers(
+        self,
+        value_bits: float | torch.Tensor = 0.0,
+    ) -> None:
+        """
+        Reset finite FTP queue backlogs between TTIs.
+
+        Full-Buffer UEs remain at their finite scheduler
+        state proxy.
+
+        The traffic RNG state and TTI sequence are preserved.
+        """
+
+        if self._active_tti_index is not None:
+            raise RuntimeError(
+                "Cannot reset traffic queues while a "
+                "TTI is active."
+            )
+
+        if isinstance(
+            value_bits,
+            torch.Tensor,
+        ):
+            if tuple(
+                value_bits.shape
+            ) != (
+                self._num_ues,
+            ):
+                raise ValueError(
+                    "Queue reset tensor must have "
+                    "shape [UE]."
+                )
+
+            if (
+                value_bits.device
+                != self._device
+            ):
+                raise ValueError(
+                    "Queue reset tensor is on the "
+                    "wrong device."
+                )
+
+            reset_value = (
+                value_bits
+                .to(
+                    dtype=self._buffer_bits.dtype
+                )
+                .detach()
+                .clone()
+            )
+
+        else:
+            scalar = float(
+                value_bits
+            )
+
+            if (
+                not math.isfinite(
+                    scalar
+                )
+                or scalar < 0.0
+            ):
+                raise ValueError(
+                    "Queue reset value must be finite "
+                    "and non-negative."
+                )
+
+            reset_value = torch.full_like(
+                self._buffer_bits,
+                fill_value=scalar,
+            )
+
+        if not torch.isfinite(
+            reset_value
+        ).all():
+            raise ValueError(
+                "Queue reset contains non-finite "
+                "values."
+            )
+
+        if torch.any(
+            reset_value < 0.0
+        ):
+            raise ValueError(
+                "Queue reset cannot be negative."
+            )
+
+        self._buffer_bits = torch.where(
+            self._full_buffer_mask,
+            torch.full_like(
+                self._buffer_bits,
+                self.full_buffer_state_bits,
+            ),
+            reset_value,
+        )
+
+
     @property
     def current_buffer_bits(
         self,

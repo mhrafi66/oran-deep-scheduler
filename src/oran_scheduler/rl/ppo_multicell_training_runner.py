@@ -464,6 +464,12 @@ def run_multicell_ppo_training(
                             tti_inputs
                             .packet_arrivals
                         ),
+
+                        tds_eligibility_override_mask=(
+                            tti_inputs
+                            .tds_eligibility_override_mask
+                        ),
+
                         device=device,
                     )
                 )
