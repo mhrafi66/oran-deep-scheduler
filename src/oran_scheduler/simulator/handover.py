@@ -231,13 +231,20 @@ class HandoverController:
         if (
             self._last_tti_index
             is not None
-            and tti_index
-            <= self._last_tti_index
         ):
-            raise ValueError(
-                "tti_index must increase "
-                "strictly."
+            expected_tti_index = (
+                self._last_tti_index
+                + 1
             )
+
+            if (
+                tti_index
+                != expected_tti_index
+            ):
+                raise ValueError(
+                    "Handover TTIs must advance "
+                    "consecutively."
+                )
 
         if link_power.ndim != 2:
             raise ValueError(

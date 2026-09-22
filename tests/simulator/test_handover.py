@@ -238,7 +238,7 @@ def test_nonconsecutive_tti_is_rejected() -> None:
 
     with pytest.raises(
         ValueError,
-        match="strictly",
+        match="consecutively",
     ):
         controller.step(
             tti_index=0,
@@ -270,4 +270,43 @@ def test_invalid_power_shape_is_rejected() -> None:
                 2,
                 2,
             ),
+        )
+
+
+def test_skipped_tti_is_rejected() -> None:
+
+    controller = HandoverController(
+        initial_serving_bs=torch.tensor(
+            [0],
+            dtype=torch.long,
+        ),
+        num_bs=2,
+        config=HandoverConfig(
+            hysteresis_db=3.0,
+            time_to_trigger_ttis=2,
+        ),
+    )
+
+    power = torch.tensor(
+        [
+            [
+                1.0,
+                4.0,
+            ]
+        ],
+        dtype=torch.float32,
+    )
+
+    controller.step(
+        tti_index=0,
+        link_power=power,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="consecutively",
+    ):
+        controller.step(
+            tti_index=2,
+            link_power=power,
         )
