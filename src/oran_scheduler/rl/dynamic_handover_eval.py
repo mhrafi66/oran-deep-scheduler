@@ -74,6 +74,15 @@ DynamicHandoverEvalObserver = Callable[
 ]
 
 
+DynamicHandoverTransitionObserver = Callable[
+    [
+        int,
+        DynamicHandoverTransition,
+    ],
+    None,
+]
+
+
 @dataclass(frozen=True)
 class DynamicHandoverEvalTTIResult:
 
@@ -174,6 +183,10 @@ def run_dynamic_multicell_ppo_evaluation(
             ...,
         ]
         | None
+    ) = None,
+
+    transition_observer: (
+        DynamicHandoverTransitionObserver | None
     ) = None,
 
     observer: (
@@ -295,6 +308,20 @@ def run_dynamic_multicell_ppo_evaluation(
         local_states = (
             transition.local_states
         )
+
+        #
+        # Called AFTER association/rematerialization
+        # but BEFORE any cell executes this TTI.
+        #
+        # This is useful for validating migrated
+        # state before the destination scheduler can
+        # consume it.
+        #
+        if transition_observer is not None:
+            transition_observer(
+                tti_index,
+                transition,
+            )
 
         num_completed_handovers += int(
             transition

@@ -452,3 +452,81 @@ def test_unknown_global_ue_is_rejected():
         registry.state_for(
             999
         )
+
+
+def test_global_registry_can_initialize_ftp_packet_state():
+    registry = GlobalUEPacketQoSRegistry(
+        global_ue_indices=torch.tensor(
+            [
+                10,
+                20,
+            ],
+            dtype=torch.long,
+        ),
+
+        full_buffer_mask=torch.tensor(
+            [
+                True,
+                False,
+            ],
+            dtype=torch.bool,
+        ),
+    )
+
+    state = PacketQoSUEState(
+        packets=(
+            PacketQoSPacketState(
+                arrival_tti=3,
+                remaining_bits=600.0,
+                deadline_missed=True,
+            ),
+        )
+    )
+
+    registry.set_state(
+        global_ue_index=20,
+        state=state,
+    )
+
+    assert (
+        registry.state_for(
+            20
+        )
+        == state
+    )
+
+
+def test_global_registry_rejects_packet_state_for_full_buffer():
+    registry = GlobalUEPacketQoSRegistry(
+        global_ue_indices=torch.tensor(
+            [
+                10,
+            ],
+            dtype=torch.long,
+        ),
+
+        full_buffer_mask=torch.tensor(
+            [
+                True,
+            ],
+            dtype=torch.bool,
+        ),
+    )
+
+    state = PacketQoSUEState(
+        packets=(
+            PacketQoSPacketState(
+                arrival_tti=0,
+                remaining_bits=800.0,
+            ),
+        )
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="Full-Buffer",
+    ):
+        registry.set_state(
+            global_ue_index=10,
+            state=state,
+        )

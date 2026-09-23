@@ -497,3 +497,146 @@ def test_dynamic_eval_rejects_radio_membership_mismatch(
     raise AssertionError(
         "Expected membership mismatch."
     )
+
+
+def test_transition_observer_runs_before_cell_execution(
+    monkeypatch,
+):
+    (
+        _,
+        coordinator,
+    ) = _system()
+
+    order = []
+
+    def link_power_provider(
+        tti_index,
+    ):
+        del tti_index
+
+        return torch.tensor(
+            [
+                [5.0, 1.0],
+                [5.0, 1.0],
+                [1.0, 5.0],
+                [1.0, 5.0],
+            ],
+            dtype=torch.float32,
+        )
+
+    def radio_provider(
+        tti_index,
+        stream_index,
+    ):
+        ids = (
+            coordinator
+            .membership_provider(
+                tti_index,
+                stream_index,
+            )
+        )
+
+        return PPOTrainingTTIInputs(
+            observation=SimpleNamespace(
+                serving_global_ue_indices=(
+                    ids.clone()
+                )
+            ),
+
+            physical_inputs_builder=(
+                lambda prepared: prepared
+            ),
+        )
+
+    def transition_observer(
+        tti_index,
+        transition,
+    ):
+        del transition
+
+        order.append(
+            (
+                "transition",
+                tti_index,
+            )
+        )
+
+    def fake_cell_step(
+        **kwargs,
+    ):
+        order.append(
+            (
+                "cell",
+                kwargs[
+                    "tti_index"
+                ],
+            )
+        )
+
+        return SimpleNamespace(
+            tti_index=(
+                kwargs[
+                    "tti_index"
+                ]
+            )
+        )
+
+    monkeypatch.setattr(
+        eval_module,
+        "run_traffic_aware_ppo_cell_tti_step",
+        fake_cell_step,
+    )
+
+    run_dynamic_multicell_ppo_evaluation(
+        start_tti_index=0,
+
+        num_ttis=1,
+
+        radio_input_provider=(
+            radio_provider
+        ),
+
+        handover_link_power_provider=(
+            link_power_provider
+        ),
+
+        coordinator=coordinator,
+
+        rollout_controllers=(
+            object(),
+            object(),
+        ),
+
+        tds_eligibility_config=object(),
+
+        state_config=object(),
+
+        greedy_config=object(),
+
+        reward_config=object(),
+
+        reward_population=(
+            "serving_ues"
+        ),
+
+        transition_observer=(
+            transition_observer
+        ),
+
+        device="cpu",
+    )
+
+    assert order == [
+        (
+            "transition",
+            0,
+        ),
+        (
+            "cell",
+            0,
+        ),
+        (
+            "cell",
+            0,
+        ),
+    ]

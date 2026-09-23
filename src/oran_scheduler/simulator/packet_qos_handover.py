@@ -411,6 +411,48 @@ class GlobalUEPacketQoSRegistry:
         ]
 
 
+    def set_state(
+        self,
+        *,
+        global_ue_index: int,
+        state: PacketQoSUEState,
+    ) -> None:
+        """
+        Initialize or replace one persistent UE's
+        packet FIFO state.
+
+        This is primarily useful when constructing
+        scientifically controlled initial conditions.
+
+        Full-Buffer UEs may not own finite packet
+        FIFO state.
+        """
+
+        key = int(
+            global_ue_index
+        )
+
+        if key not in self._state_by_ue:
+            raise KeyError(
+                f"Unknown global UE {key}."
+            )
+
+        if (
+            self._full_buffer_by_ue[
+                key
+            ]
+            and state.packets
+        ):
+            raise ValueError(
+                "Full-Buffer UE cannot own "
+                "finite packet FIFO state."
+            )
+
+        self._state_by_ue[
+            key
+        ] = state
+
+
     def synchronize_from_local(
         self,
         *,
