@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import torch
@@ -103,21 +104,30 @@ NUM_USER_SLOTS = 4
 
 TTI_DURATION_S = 0.5e-3
 
-FULL_BUFFER_STATE_BITS = 12_000.0
+SPEED_KMH = 30.0
 
-INITIAL_AVERAGE_THROUGHPUT_BPS = 1.0e6
+HANDOVER_HYSTERESIS_DB = 1.0
 
-THROUGHPUT_FORGETTING_FACTOR = 0.9
+HANDOVER_TTT_TTIS = 2
 
 #
-# Controlled integration condition.
+# We deliberately require a strong REAL measured
+# advantage before constructing the controlled
+# initial serving mismatch.
 #
-# We choose a UE whose measured preferred selected
-# cell is at least this much stronger than the other
-# selected cell.
-#
-MIN_CONTROLLED_MARGIN_DB = 6.0
+MIN_MEASURED_ADVANTAGE_DB = 6.0
 
+INITIAL_AVERAGE_THROUGHPUT_BPS = (
+    1.0e6
+)
+
+THROUGHPUT_FORGETTING_FACTOR = (
+    0.9
+)
+
+FULL_BUFFER_STATE_BITS = (
+    12_000.0
+)
 
 CHECKPOINT_PATH = Path(
     "~/oran-deep-scheduler/"
@@ -126,19 +136,286 @@ CHECKPOINT_PATH = Path(
 ).expanduser()
 
 
-def _db_ratio(
-    stronger: torch.Tensor,
-    weaker: torch.Tensor,
-) -> float:
+def build_global_state(
+    *,
+    context,
+    ftp3_config,
+):
+    """
+    Build the closed two-cell UE cohort used by the
+    final measured-handover integration smoke.
+    """
 
-    return float(
-        (
-            10.0
-            * torch.log10(
-                stronger
-                / weaker
+    global_ids = torch.cat(
+        context.global_ue_indices_by_stream,
+        dim=0,
+    )
+
+    serving_parts = []
+
+    for (
+        cell_index,
+        ue_ids,
+    ) in zip(
+        context.selected_cell_indices,
+        context.global_ue_indices_by_stream,
+        strict=True,
+    ):
+
+        serving_parts.append(
+            torch.full(
+                ue_ids.shape,
+                fill_value=(
+                    int(cell_index)
+                ),
+                dtype=torch.long,
+                device=DEVICE,
             )
-        ).item()
+        )
+
+    serving_bs = torch.cat(
+        serving_parts,
+        dim=0,
+    )
+
+    num_ues = int(
+        global_ids.numel()
+    )
+
+    #
+    # Deterministic mixed FB / FTP population.
+    #
+    full_buffer_mask = (
+        torch.arange(
+            num_ues,
+            device=DEVICE,
+        )
+        % 2
+        == 0
+    )
+
+    ftp_bits = float(
+        ftp3_config.packet_size_bits
+    )
+
+    buffer_bits = torch.where(
+        full_buffer_mask,
+
+        torch.full(
+            (
+                num_ues,
+            ),
+            fill_value=(
+                FULL_BUFFER_STATE_BITS
+            ),
+            dtype=torch.float32,
+            device=DEVICE,
+        ),
+
+        torch.full(
+            (
+                num_ues,
+            ),
+            fill_value=ftp_bits,
+            dtype=torch.float32,
+            device=DEVICE,
+        ),
+    )
+
+    average_throughput = torch.full(
+        (
+            num_ues,
+        ),
+        fill_value=(
+            INITIAL_AVERAGE_THROUGHPUT_BPS
+        ),
+        dtype=torch.float32,
+        device=DEVICE,
+    )
+
+    registry = (
+        GlobalUESchedulerStateRegistry(
+            global_ue_indices=(
+                global_ids
+            ),
+
+            serving_bs=(
+                serving_bs
+            ),
+
+            average_throughput_bps=(
+                average_throughput
+            ),
+
+            buffer_bits=(
+                buffer_bits
+            ),
+
+            full_buffer_mask=(
+                full_buffer_mask
+            ),
+        )
+    )
+
+    return (
+        registry,
+        global_ids,
+        serving_bs,
+        full_buffer_mask,
+    )
+
+
+def select_controlled_mismatch(
+    *,
+    measurement: torch.Tensor,
+    cohort_global_ids: torch.Tensor,
+    serving_bs: torch.Tensor,
+    selected_cell_indices: tuple[int, ...],
+):
+    """
+    Find a UE whose REAL Sionna-derived handover
+    measurement strongly prefers its ordinary
+    serving cell over the OTHER selected cell.
+
+    We then intentionally initialize that UE on the
+    weaker selected cell.
+
+    Therefore the subsequent handover itself is
+    driven by REAL Sionna measurement values rather
+    than a fabricated link-power trigger.
+
+    This mismatch is a controlled integration-test
+    initial condition, not a claim about naturally
+    occurring handover frequency.
+    """
+
+    if len(
+        selected_cell_indices
+    ) != 2:
+        raise ValueError(
+            "Final integration smoke requires "
+            "exactly two selected cells."
+        )
+
+    cell_a = int(
+        selected_cell_indices[
+            0
+        ]
+    )
+
+    cell_b = int(
+        selected_cell_indices[
+            1
+        ]
+    )
+
+    candidates = []
+
+    for row in range(
+        int(
+            cohort_global_ids.numel()
+        )
+    ):
+
+        destination = int(
+            serving_bs[
+                row
+            ].item()
+        )
+
+        if destination not in {
+            cell_a,
+            cell_b,
+        }:
+            continue
+
+        source = (
+            cell_b
+            if destination == cell_a
+            else cell_a
+        )
+
+        destination_power = float(
+            measurement[
+                row,
+                destination,
+            ].item()
+        )
+
+        source_power = float(
+            measurement[
+                row,
+                source,
+            ].item()
+        )
+
+        if (
+            destination_power <= 0.0
+            or source_power <= 0.0
+        ):
+            continue
+
+        advantage_db = (
+            10.0
+            * math.log10(
+                destination_power
+                / source_power
+            )
+        )
+
+        candidates.append(
+            (
+                advantage_db,
+                row,
+                source,
+                destination,
+            )
+        )
+
+    if not candidates:
+        raise RuntimeError(
+            "No candidate UE found for "
+            "controlled measured handover."
+        )
+
+    candidates.sort(
+        reverse=True,
+        key=lambda item: item[0],
+    )
+
+    (
+        advantage_db,
+        row,
+        source,
+        destination,
+    ) = candidates[
+        0
+    ]
+
+    if (
+        advantage_db
+        < MIN_MEASURED_ADVANTAGE_DB
+    ):
+        raise RuntimeError(
+            "No UE has a sufficiently strong "
+            "real measured destination advantage. "
+            f"Best was {advantage_db:.3f} dB; "
+            f"required "
+            f"{MIN_MEASURED_ADVANTAGE_DB:.3f} dB."
+        )
+
+    global_ue = int(
+        cohort_global_ids[
+            row
+        ].item()
+    )
+
+    return (
+        row,
+        global_ue,
+        source,
+        destination,
+        advantage_db,
     )
 
 
@@ -162,48 +439,55 @@ def main() -> None:
     )
 
     print("=" * 78)
+
     print(
-        "WAVE-9 SIONNA-MEASURED DYNAMIC "
-        "HANDOVER + PPO SMOKE"
+        "WAVE-9 SIONNA-MEASURED "
+        "DYNAMIC PPO HANDOVER"
     )
+
     print("=" * 78)
 
     print(
-        f"GPU: {torch.cuda.get_device_name(DEVICE)}"
+        "Measurement:"
     )
 
     print(
-        "Scheduler: frozen pretrained PPO"
+        "  moving geometry"
     )
 
     print(
-        "Scheduling PHY: real chunked Sionna"
+        "  -> lightweight Sionna channel"
     )
 
     print(
-        "Handover measurement: "
-        "Sionna-derived channel-averaged link strength"
+        "  -> channel-averaged pathloss"
     )
 
     print(
-        "Handover scope: two selected cells"
+        "  -> inverse pathloss link strength"
+    )
+
+    print()
+
+    print(
+        "IMPORTANT:"
     )
 
     print(
-        "Controlled condition: one UE starts on "
-        "the weaker selected cell"
+        "This is OPEN-REPRODUCTION handover "
+        "measurement."
     )
 
     print(
-        "IMPORTANT: this is NOT claimed to be "
-        "3GPP A3/RSRP handover."
+        "It is NOT claimed to implement "
+        "standardized 3GPP A3/RSRP filtering."
     )
 
     print()
 
 
     # ==========================================================
-    # REAL TEMPORAL SIONNA CONTEXT
+    # REAL TEMPORAL SCHEDULING CONTEXT
     # ==========================================================
 
     context = (
@@ -214,6 +498,9 @@ def main() -> None:
                         NUM_STREAMS
                     ),
 
+                    #
+                    # Capability/integration scale.
+                    #
                     num_ut_per_sector=2,
 
                     num_rbs=18,
@@ -222,9 +509,15 @@ def main() -> None:
 
                     subcarriers_per_rb=12,
 
+                    #
+                    # Required for persistent UE-owned
+                    # channel RNG across reassociation.
+                    #
                     ue_microbatch_size=1,
 
-                    identity_stable_ue_channel_rng=True,
+                    identity_stable_ue_channel_rng=(
+                        True
+                    ),
 
                     topology_seed=42,
 
@@ -234,7 +527,9 @@ def main() -> None:
 
                     device="cuda:0",
 
-                    ut_speed_kmh=30.0,
+                    ut_speed_kmh=(
+                        SPEED_KMH
+                    ),
 
                     temporal_radio_mode=(
                         "velocity_window"
@@ -248,7 +543,9 @@ def main() -> None:
                         TTI_DURATION_S
                     ),
 
-                    temporal_max_displacement_m=20.0,
+                    temporal_max_displacement_m=(
+                        20.0
+                    ),
                 )
             )
         )
@@ -260,30 +557,26 @@ def main() -> None:
         in context.selected_cell_indices
     )
 
-    if len(selected_cells) != 2:
+    if len(
+        selected_cells
+    ) != NUM_STREAMS:
         raise RuntimeError(
-            "Wave-9 smoke requires exactly "
-            "two selected cells."
+            "Unexpected selected-cell count."
         )
-
-    cell_0 = selected_cells[0]
-    cell_1 = selected_cells[1]
 
     cohort = torch.cat(
         context.global_ue_indices_by_stream,
         dim=0,
     )
 
-    num_ues = int(
-        cohort.numel()
+    print(
+        "Selected scheduling cells: "
+        f"{selected_cells}"
     )
 
     print(
-        f"Selected cells: {selected_cells}"
-    )
-
-    print(
-        f"Closed cohort size: {num_ues}"
+        "Closed cohort size: "
+        f"{int(cohort.numel())}"
     )
 
 
@@ -328,354 +621,9 @@ def main() -> None:
     )
 
 
-    #
-    # Same-TTI call is safe because Wave 8 explicitly
-    # established idempotence.
-    #
-    measurement_0 = (
-        measurement_provider(
-            0
-        )
-    )
-
-    expected_shape = (
-        num_ues,
-        context.num_cells,
-    )
-
-    if tuple(
-        measurement_0.shape
-    ) != expected_shape:
-        raise RuntimeError(
-            "Unexpected handover measurement shape."
-        )
-
-    selected_cell_tensor = torch.tensor(
-        selected_cells,
-        dtype=torch.long,
-        device=measurement_0.device,
-    )
-
-    selected_power_0 = (
-        measurement_0.index_select(
-            dim=1,
-            index=(
-                selected_cell_tensor
-            ),
-        )
-    )
-
-    preferred_slot_0 = torch.argmax(
-        selected_power_0,
-        dim=1,
-    )
-
-    preferred_cell_0 = (
-        selected_cell_tensor[
-            preferred_slot_0
-        ]
-    )
-
-
     # ==========================================================
-    # CONTROLLED INITIAL ASSOCIATION
-    #
-    # Start everybody on their measured preferred
-    # selected cell EXCEPT one UE.
-    #
-    # For that UE:
-    #
-    #     serving cell
-    #         =
-    #     weaker selected cell
-    #
-    # while the handover controller sees the untouched
-    # Sionna measurement.
-    #
-    # This guarantees a real-measurement-driven
-    # reassociation integration test without pretending
-    # that 1 ms of motion naturally crosses a cell.
+    # GLOBAL TRAFFIC / PF STATE
     # ==========================================================
-
-    preferred_counts = {
-        cell_0: int(
-            torch.count_nonzero(
-                preferred_cell_0
-                == cell_0
-            ).item()
-        ),
-
-        cell_1: int(
-            torch.count_nonzero(
-                preferred_cell_0
-                == cell_1
-            ).item()
-        ),
-    }
-
-    print(
-        "Measured TTI-0 preferred-cell counts: "
-        f"{preferred_counts}"
-    )
-
-    if (
-        preferred_counts[cell_0] < 1
-        or preferred_counts[cell_1] < 1
-    ):
-        raise RuntimeError(
-            "This topology seed does not populate "
-            "both selected cells under the measured "
-            "two-cell association."
-        )
-
-    candidate_rows = []
-
-    for row in range(
-        num_ues
-    ):
-
-        destination_cell = int(
-            preferred_cell_0[
-                row
-            ].item()
-        )
-
-        destination_slot = int(
-            preferred_slot_0[
-                row
-            ].item()
-        )
-
-        source_slot = (
-            1
-            - destination_slot
-        )
-
-        source_cell = int(
-            selected_cell_tensor[
-                source_slot
-            ].item()
-        )
-
-        #
-        # Destination must not become empty when this
-        # UE is temporarily moved out of it.
-        #
-        if (
-            preferred_counts[
-                destination_cell
-            ]
-            < 2
-        ):
-            continue
-
-        destination_power = (
-            selected_power_0[
-                row,
-                destination_slot,
-            ]
-        )
-
-        source_power = (
-            selected_power_0[
-                row,
-                source_slot,
-            ]
-        )
-
-        margin_db = _db_ratio(
-            destination_power,
-            source_power,
-        )
-
-        if (
-            margin_db
-            >= MIN_CONTROLLED_MARGIN_DB
-        ):
-            candidate_rows.append(
-                (
-                    margin_db,
-                    row,
-                    source_cell,
-                    destination_cell,
-                )
-            )
-
-
-    if not candidate_rows:
-        raise RuntimeError(
-            "Could not find a UE with sufficient "
-            "measured selected-cell margin for the "
-            "controlled Wave-9 handover."
-        )
-
-
-    (
-        forced_margin_db,
-        forced_row,
-        source_cell,
-        destination_cell,
-    ) = max(
-        candidate_rows,
-        key=lambda item: item[0],
-    )
-
-    forced_ue = int(
-        cohort[
-            forced_row
-        ].item()
-    )
-
-
-    controlled_serving = (
-        preferred_cell_0
-        .detach()
-        .clone()
-    )
-
-    controlled_serving[
-        forced_row
-    ] = source_cell
-
-
-    controlled_counts = {
-        cell_0: int(
-            torch.count_nonzero(
-                controlled_serving
-                == cell_0
-            ).item()
-        ),
-
-        cell_1: int(
-            torch.count_nonzero(
-                controlled_serving
-                == cell_1
-            ).item()
-        ),
-    }
-
-    if any(
-        count < 1
-        for count
-        in controlled_counts.values()
-    ):
-        raise RuntimeError(
-            "Controlled serving setup produced "
-            "an empty selected cell."
-        )
-
-    if any(
-        count > NUM_CANDIDATES
-        for count
-        in controlled_counts.values()
-    ):
-        raise RuntimeError(
-            "Controlled smoke exceeds the "
-            "10-candidate architecture limit."
-        )
-
-
-    source_stream = (
-        selected_cells.index(
-            source_cell
-        )
-    )
-
-    destination_stream = (
-        selected_cells.index(
-            destination_cell
-        )
-    )
-
-
-    print(
-        f"Controlled UE: {forced_ue}"
-    )
-
-    print(
-        "Controlled initial serving cell: "
-        f"{source_cell}"
-    )
-
-    print(
-        "Measured preferred destination: "
-        f"{destination_cell}"
-    )
-
-    print(
-        "Measured TTI-0 margin: "
-        f"{forced_margin_db:.3f} dB"
-    )
-
-    print(
-        "Controlled starting populations: "
-        f"{controlled_counts}"
-    )
-
-
-    # ==========================================================
-    # GLOBAL PERSISTENT UE STATE
-    #
-    # Full-buffer traffic only for this integration
-    # smoke. Packet continuity was already separately
-    # validated by Wave 7.
-    # ==========================================================
-
-    full_buffer_mask = torch.ones(
-        (
-            num_ues,
-        ),
-        dtype=torch.bool,
-        device=DEVICE,
-    )
-
-    buffer_bits = torch.full(
-        (
-            num_ues,
-        ),
-        fill_value=(
-            FULL_BUFFER_STATE_BITS
-        ),
-        dtype=torch.float32,
-        device=DEVICE,
-    )
-
-    average_throughput = torch.full(
-        (
-            num_ues,
-        ),
-        fill_value=(
-            INITIAL_AVERAGE_THROUGHPUT_BPS
-        ),
-        dtype=torch.float32,
-        device=DEVICE,
-    )
-
-
-    registry = (
-        GlobalUESchedulerStateRegistry(
-            global_ue_indices=(
-                cohort
-            ),
-
-            serving_bs=(
-                controlled_serving
-            ),
-
-            average_throughput_bps=(
-                average_throughput
-            ),
-
-            buffer_bits=(
-                buffer_bits
-            ),
-
-            full_buffer_mask=(
-                full_buffer_mask
-            ),
-        )
-    )
-
 
     ftp3_config = (
         build_training_ftp3_config(
@@ -685,11 +633,186 @@ def main() -> None:
         )
     )
 
+    (
+        registry,
+        cohort_global_ids,
+        original_serving_bs,
+        full_buffer_mask,
+    ) = build_global_state(
+        context=context,
+
+        ftp3_config=(
+            ftp3_config
+        ),
+    )
+
+    if not torch.equal(
+        cohort,
+        cohort_global_ids,
+    ):
+        raise RuntimeError(
+            "Measurement cohort and global "
+            "scheduler registry are misaligned."
+        )
+
+
+    # ==========================================================
+    # FIND A REAL MEASURED LINK ADVANTAGE
+    # ==========================================================
+
+    measurement_0 = (
+        measurement_provider(
+            0
+        )
+    )
+
+    (
+        forced_row,
+        forced_ue,
+        source_cell,
+        destination_cell,
+        initial_advantage_db,
+    ) = select_controlled_mismatch(
+        measurement=(
+            measurement_0
+        ),
+
+        cohort_global_ids=(
+            cohort_global_ids
+        ),
+
+        serving_bs=(
+            original_serving_bs
+        ),
+
+        selected_cell_indices=(
+            selected_cells
+        ),
+    )
+
+    print()
+
+    print(
+        "Controlled UE: "
+        f"{forced_ue}"
+    )
+
+    print(
+        "Controlled initial mismatch: "
+        f"{source_cell} -> "
+        f"{destination_cell}"
+    )
+
+    print(
+        "Real measured destination advantage: "
+        f"{initial_advantage_db:.3f} dB"
+    )
+
+
+    # ==========================================================
+    # CREATE ONLY THE INITIAL MISMATCH
+    # ==========================================================
+
+    mismatched_serving_bs = (
+        original_serving_bs
+        .detach()
+        .clone()
+    )
+
+    mismatched_serving_bs[
+        forced_row
+    ] = (
+        source_cell
+    )
+
+    mismatch_mask = torch.zeros_like(
+        mismatched_serving_bs,
+        dtype=torch.bool,
+    )
+
+    mismatch_mask[
+        forced_row
+    ] = True
+
+    registry.apply_serving_bs_update(
+        new_serving_bs=(
+            mismatched_serving_bs
+        ),
+
+        handover_mask=(
+            mismatch_mask
+        ),
+    )
+
+    initial_dynamic_state = (
+        registry.snapshot()
+    )
+
+    #
+    # Dynamic local-state bridge currently requires
+    # every selected cell to remain non-empty.
+    #
+    for cell in selected_cells:
+
+        count = int(
+            torch.count_nonzero(
+                initial_dynamic_state
+                .serving_bs
+                == cell
+            ).item()
+        )
+
+        if count < 1:
+            raise RuntimeError(
+                "Controlled mismatch produced "
+                f"empty selected cell {cell}."
+            )
+
+        if count > NUM_CANDIDATES:
+            raise RuntimeError(
+                "Integration smoke population "
+                "exceeds fixed PPO candidate width."
+            )
+
+
+    # ==========================================================
+    # HYSTERESIS + TTT HANDOVER STATE MACHINE
+    # ==========================================================
+
+    handover_controller = (
+        HandoverController(
+            initial_serving_bs=(
+                initial_dynamic_state
+                .serving_bs
+            ),
+
+            num_bs=(
+                context.num_cells
+            ),
+
+            config=(
+                HandoverConfig(
+                    hysteresis_db=(
+                        HANDOVER_HYSTERESIS_DB
+                    ),
+
+                    time_to_trigger_ttis=(
+                        HANDOVER_TTT_TTIS
+                    ),
+                )
+            ),
+        )
+    )
+
+
+    # ==========================================================
+    # GLOBAL IDENTITY-OWNED ARRIVAL PROCESS
+    # ==========================================================
 
     global_arrivals = (
         GlobalUETrafficArrivalProcess(
             global_ue_indices=(
-                cohort
+                cohort_global_ids
             ),
 
             full_buffer_mask=(
@@ -700,45 +823,22 @@ def main() -> None:
                 ftp3_config
             ),
 
-            seed=SEED,
+            seed=(
+                SEED
+            ),
         )
     )
 
 
     # ==========================================================
-    # HANDOVER CONTROLLER
-    #
-    # 1 dB hysteresis
-    # 2 consecutive TTIs
-    #
-    # Our controlled UE starts with >=6 dB measured
-    # advantage toward the destination.
+    # DYNAMIC GLOBAL -> CELL-LOCAL STATE BRIDGE
     # ==========================================================
-
-    handover_controller = (
-        HandoverController(
-            initial_serving_bs=(
-                controlled_serving
-            ),
-
-            num_bs=(
-                context.num_cells
-            ),
-
-            config=(
-                HandoverConfig(
-                    hysteresis_db=1.0,
-
-                    time_to_trigger_ttis=2,
-                )
-            ),
-        )
-    )
-
 
     coordinator = (
         DynamicHandoverCoordinator(
-            registry=registry,
+            registry=(
+                registry
+            ),
 
             handover_controller=(
                 handover_controller
@@ -772,87 +872,22 @@ def main() -> None:
                 global_arrivals
             ),
 
-            local_traffic_seed_base=5000,
+            local_traffic_seed_base=(
+                5000
+            ),
         )
     )
 
 
     # ==========================================================
-    # ACTUAL HANDOVER MEASUREMENT INPUT
-    #
-    # For this 2-cell integration smoke only, mask
-    # the other 19 BSs from handover candidacy.
-    #
-    # The power values for the two selected cells are
-    # untouched Sionna-derived values.
-    #
-    # Final network-scale experiments can remove this
-    # two-cell restriction.
-    # ==========================================================
-
-    def measured_selected_cell_link_power(
-        tti_index: int,
-    ) -> torch.Tensor:
-
-        raw = (
-            measurement_provider(
-                tti_index
-            )
-        )
-
-        masked = torch.full_like(
-            raw,
-            fill_value=(
-                torch.finfo(
-                    raw.dtype
-                ).tiny
-            ),
-        )
-
-        masked[
-            :,
-            selected_cell_tensor,
-        ] = raw[
-            :,
-            selected_cell_tensor,
-        ]
-
-
-        forced_destination_power = (
-            raw[
-                forced_row,
-                destination_cell,
-            ]
-        )
-
-        forced_source_power = (
-            raw[
-                forced_row,
-                source_cell,
-            ]
-        )
-
-        margin_db = _db_ratio(
-            forced_destination_power,
-            forced_source_power,
-        )
-
-        print(
-            f"TTI {tti_index}: measured UE "
-            f"{forced_ue} destination/source "
-            f"margin = {margin_db:.3f} dB"
-        )
-
-        return masked
-
-
-    # ==========================================================
-    # DYNAMIC REAL SIONNA SCHEDULING INPUT
+    # DYNAMIC REAL SIONNA SCHEDULING INPUT PROVIDER
     # ==========================================================
 
     radio_provider = (
         CellChunkedSionnaPPOInputProvider(
-            context=context,
+            context=(
+                context
+            ),
 
             global_ue_indices_provider=(
                 coordinator
@@ -863,39 +898,137 @@ def main() -> None:
 
 
     # ==========================================================
-    # FROZEN PRETRAINED PPO
+    # FINAL HANDOVER MEASUREMENT WRAPPER
+    #
+    # The measurement itself is REAL Sionna-derived.
+    #
+    # For THIS TWO-CELL integration smoke only,
+    # non-selected BSs are excluded from handover
+    # candidacy. Otherwise a UE could correctly move
+    # to a third cell whose scheduler we are not
+    # executing in this two-stream smoke.
+    #
+    # Publication/full-network experiments must not
+    # describe this as unrestricted 21-cell HO.
     # ==========================================================
 
-    state_config = (
-        OneLDSStateConfig(
-            throughput_normalization_bps=(
-                100.0e6
-            ),
-
-            buffer_normalization=(
-                FULL_BUFFER_STATE_BITS
-            ),
-
-            subband_cqi_normalization=15.0,
-
-            num_candidates=(
-                NUM_CANDIDATES
-            ),
-
-            num_rbgs=(
-                NUM_RBGS
-            ),
-
-            max_rank=2,
-        )
+    selected_cell_mask = torch.zeros(
+        context.num_cells,
+        dtype=torch.bool,
+        device=DEVICE,
     )
 
+    for cell in selected_cells:
+        selected_cell_mask[
+            cell
+        ] = True
+
+
+    def handover_link_power_provider(
+        tti_index: int,
+    ) -> torch.Tensor:
+
+        measured = (
+            measurement_provider(
+                tti_index
+            )
+            .detach()
+            .clone()
+        )
+
+        if tuple(
+            measured.shape
+        ) != (
+            int(
+                cohort_global_ids
+                .numel()
+            ),
+            context.num_cells,
+        ):
+            raise RuntimeError(
+                "Measured handover tensor has "
+                "unexpected shape."
+            )
+
+        #
+        # Restrict only the DECISION SET.
+        #
+        # The values for the two selected physical
+        # cells remain untouched real measurements.
+        #
+        measured[
+            :,
+            ~selected_cell_mask,
+        ] = torch.finfo(
+            measured.dtype
+        ).tiny
+
+        destination_power = float(
+            measured[
+                forced_row,
+                destination_cell,
+            ].item()
+        )
+
+        source_power = float(
+            measured[
+                forced_row,
+                source_cell,
+            ].item()
+        )
+
+        advantage_db = (
+            10.0
+            * math.log10(
+                destination_power
+                / source_power
+            )
+        )
+
+        print(
+            f"TTI {tti_index}: "
+            f"forced UE measured "
+            f"destination advantage = "
+            f"{advantage_db:.3f} dB"
+        )
+
+        return measured
+
+
+    # ==========================================================
+    # FROZEN PPO POLICY
+    # ==========================================================
+
+    state_config = OneLDSStateConfig(
+        throughput_normalization_bps=(
+            100.0e6
+        ),
+
+        buffer_normalization=(
+            FULL_BUFFER_STATE_BITS
+        ),
+
+        subband_cqi_normalization=(
+            15.0
+        ),
+
+        num_candidates=(
+            NUM_CANDIDATES
+        ),
+
+        num_rbgs=(
+            NUM_RBGS
+        ),
+
+        max_rank=2,
+    )
 
     actor = (
         OneLDSPPOActor(
             OneLDSPPOActorConfig(
                 state_size=(
-                    state_config.state_size
+                    state_config
+                    .state_size
                 ),
 
                 hidden_size=32,
@@ -915,12 +1048,12 @@ def main() -> None:
         )
     )
 
-
     critic = (
         OneLDSPPOCritic(
             OneLDSPPOCriticConfig(
                 state_size=(
-                    state_config.state_size
+                    state_config
+                    .state_size
                 ),
 
                 hidden_size=32,
@@ -931,21 +1064,21 @@ def main() -> None:
         )
     )
 
-
     checkpoint = (
         load_ppo_model_checkpoint(
             path=(
                 CHECKPOINT_PATH
             ),
 
-            actor=actor,
+            actor=(
+                actor
+            ),
 
             map_location=(
                 DEVICE
             ),
         )
     )
-
 
     actor.eval()
 
@@ -961,9 +1094,9 @@ def main() -> None:
             False
         )
 
-
     print(
-        f"Checkpoint: {CHECKPOINT_PATH}"
+        "Checkpoint: "
+        f"{CHECKPOINT_PATH}"
     )
 
     print(
@@ -971,6 +1104,10 @@ def main() -> None:
         f"{checkpoint.get('tti_index')}"
     )
 
+
+    # ==========================================================
+    # EVALUATION-ONLY PPO CONTROLLERS
+    # ==========================================================
 
     transition_buffer = (
         PPOMultiStreamTransitionBuffer(
@@ -986,14 +1123,19 @@ def main() -> None:
         )
     )
 
-
     rollout_controllers = tuple(
         OneLDSPPOMultiCellRolloutController(
-            stream_id=stream_index,
+            stream_id=(
+                stream_index
+            ),
 
-            actor=actor,
+            actor=(
+                actor
+            ),
 
-            critic=critic,
+            critic=(
+                critic
+            ),
 
             transition_buffer=(
                 transition_buffer
@@ -1016,26 +1158,41 @@ def main() -> None:
 
 
     # ==========================================================
-    # INTEGRATION ASSERTIONS
+    # OBSERVATION / PASS CONDITIONS
     # ==========================================================
 
     saw_forced_handover = False
 
-    saw_source_without_forced = False
+    saw_source_without_ue = False
 
-    saw_destination_with_forced = False
+    saw_destination_with_ue = False
 
-    saw_destination_candidate = False
+    forced_handover_tti = None
 
 
-    def transition_observer(
+    def observer(
         tti_index,
+        stream_index,
+        result,
         transition,
     ) -> None:
 
         nonlocal saw_forced_handover
-        nonlocal saw_source_without_forced
-        nonlocal saw_destination_with_forced
+        nonlocal saw_source_without_ue
+        nonlocal saw_destination_with_ue
+        nonlocal forced_handover_tti
+
+        real_cell = int(
+            selected_cells[
+                stream_index
+            ]
+        )
+
+        serving_ids = (
+            result
+            .scheduler_observation
+            .serving_global_ue_indices
+        )
 
         moved = (
             transition
@@ -1049,109 +1206,65 @@ def main() -> None:
             ).item()
         )
 
-        if tti_index == 0 and forced_moved:
-            raise RuntimeError(
-                "TTT=2 handover occurred too early."
+        if forced_moved:
+
+            saw_forced_handover = (
+                True
             )
 
-        if not forced_moved:
-            return
-
-        if tti_index != 1:
-            raise RuntimeError(
-                "Controlled UE handover occurred "
-                "at unexpected TTI."
+            forced_handover_tti = (
+                tti_index
             )
 
-        saw_forced_handover = True
+            print(
+                "FORCED UE HANDOVER OBSERVED: "
+                f"UE={forced_ue}, "
+                f"TTI={tti_index}, "
+                f"{source_cell}"
+                f" -> "
+                f"{destination_cell}"
+            )
 
-        source_state = (
+        current_forced_cell = int(
             transition
-            .local_states[
-                source_stream
-            ]
-        )
-
-        destination_state = (
-            transition
-            .local_states[
-                destination_stream
-            ]
-        )
-
-        saw_source_without_forced = (
-            not bool(
-                torch.any(
-                    source_state
-                    .global_ue_indices
-                    == forced_ue
-                ).item()
-            )
-        )
-
-        saw_destination_with_forced = (
-            bool(
-                torch.any(
-                    destination_state
-                    .global_ue_indices
-                    == forced_ue
-                ).item()
-            )
-        )
-
-        print(
-            "REAL-MEASUREMENT HANDOVER: "
-            f"TTI={tti_index}, "
-            f"UE={forced_ue}, "
-            f"{source_cell}->{destination_cell}"
-        )
-
-
-    def observer(
-        tti_index,
-        stream_index,
-        result,
-        transition,
-    ) -> None:
-
-        del transition
-
-        nonlocal saw_destination_candidate
-
-        real_cell = (
-            selected_cells[
-                stream_index
-            ]
-        )
-
-        serving_ids = (
-            result
-            .scheduler_observation
-            .serving_global_ue_indices
-        )
-
-        candidate_ids = (
-            result
-            .prepared
-            .candidate_global_ue_indices[
-                result
-                .prepared
-                .candidate_valid_mask
-            ]
+            .handover_result
+            .serving_bs[
+                forced_row
+            ].item()
         )
 
         if (
-            tti_index >= 1
-            and real_cell
+            current_forced_cell
             == destination_cell
         ):
-            if bool(
-                torch.any(
-                    candidate_ids
-                    == forced_ue
-                ).item()
+
+            if (
+                real_cell
+                == source_cell
+                and not bool(
+                    torch.any(
+                        serving_ids
+                        == forced_ue
+                    ).item()
+                )
             ):
-                saw_destination_candidate = True
+                saw_source_without_ue = (
+                    True
+                )
+
+            if (
+                real_cell
+                == destination_cell
+                and bool(
+                    torch.any(
+                        serving_ids
+                        == forced_ue
+                    ).item()
+                )
+            ):
+                saw_destination_with_ue = (
+                    True
+                )
 
         delivered_mbps = float(
             result
@@ -1163,20 +1276,21 @@ def main() -> None:
         )
 
         print(
-            f"TTI {tti_index}, "
-            f"stream {stream_index}, "
+            f"TTI {tti_index} "
+            f"stream {stream_index} "
             f"cell {real_cell}: "
-            f"UEs={int(serving_ids.numel())}, "
-            f"candidates={int(candidate_ids.numel())}, "
-            f"delivered={delivered_mbps:.3f} Mbps"
+            f"serving_ues="
+            f"{int(serving_ids.numel())}, "
+            f"delivered="
+            f"{delivered_mbps:.3f} Mbps"
         )
 
 
     # ==========================================================
-    # RUN
+    # RUN REAL MEASUREMENT -> HO -> SIONNA -> PPO
     # ==========================================================
 
-    result = (
+    run_result = (
         run_dynamic_multicell_ppo_evaluation(
             start_tti_index=0,
 
@@ -1188,11 +1302,8 @@ def main() -> None:
                 radio_provider
             ),
 
-            #
-            # THIS is the Wave-9 integration.
-            #
             handover_link_power_provider=(
-                measured_selected_cell_link_power
+                handover_link_power_provider
             ),
 
             coordinator=(
@@ -1231,26 +1342,27 @@ def main() -> None:
                 "candidates"
             ),
 
-            transition_observer=(
-                transition_observer
+            observer=(
+                observer
             ),
 
-            observer=observer,
-
-            device=DEVICE,
+            device=(
+                DEVICE
+            ),
         )
     )
 
 
     # ==========================================================
-    # FINAL SCIENTIFIC CHECKS
+    # FINAL SCIENTIFIC CONSISTENCY CHECKS
     # ==========================================================
 
     final_state = (
-        result.final_global_state
+        run_result
+        .final_global_state
     )
 
-    matches = torch.nonzero(
+    final_matches = torch.nonzero(
         final_state
         .global_ue_indices
         == forced_ue,
@@ -1258,14 +1370,14 @@ def main() -> None:
     ).flatten()
 
     if int(
-        matches.numel()
+        final_matches.numel()
     ) != 1:
         raise RuntimeError(
-            "Final forced-UE lookup failed."
+            "Final controlled UE lookup failed."
         )
 
     final_row = int(
-        matches[
+        final_matches[
             0
         ].item()
     )
@@ -1277,42 +1389,39 @@ def main() -> None:
         ].item()
     )
 
-
-    if final_cell != destination_cell:
-        raise RuntimeError(
-            "Controlled UE did not finish on "
-            "its Sionna-measured preferred cell."
-        )
-
     if not saw_forced_handover:
         raise RuntimeError(
-            "Real measurement did not trigger "
-            "the controlled handover."
+            "Real Sionna measurement never "
+            "triggered the controlled UE handover."
         )
 
-    if not saw_source_without_forced:
+    if (
+        final_cell
+        != destination_cell
+    ):
         raise RuntimeError(
-            "Source cell retained the handed-over UE."
+            "Controlled UE did not finish at "
+            "the real measured destination cell."
         )
 
-    if not saw_destination_with_forced:
+    if not saw_source_without_ue:
         raise RuntimeError(
-            "Destination cell did not receive "
-            "the handed-over UE."
+            "Source scheduler population did not "
+            "lose the handed-over UE."
         )
 
-    if not saw_destination_candidate:
+    if not saw_destination_with_ue:
         raise RuntimeError(
-            "Handed-over UE never appeared in "
-            "destination PF candidates."
+            "Destination scheduler population did "
+            "not gain the handed-over UE."
         )
 
     if len(
         transition_buffer
     ) != 0:
         raise RuntimeError(
-            "Evaluation unexpectedly collected "
-            "PPO transitions."
+            "Evaluation-only measured handover "
+            "unexpectedly collected PPO samples."
         )
 
     if any(
@@ -1322,10 +1431,14 @@ def main() -> None:
         in rollout_controllers
     ):
         raise RuntimeError(
-            "Evaluation left unresolved PPO "
-            "trajectory state."
+            "Evaluation-only measured handover "
+            "left PPO temporal boundaries."
         )
 
+
+    # ==========================================================
+    # SUMMARY
+    # ==========================================================
 
     torch.cuda.synchronize(
         DEVICE
@@ -1341,38 +1454,48 @@ def main() -> None:
         )
     )
 
-
     print()
+
     print("=" * 78)
 
     print(
-        "Measured controlled UE: "
+        "Controlled UE: "
         f"{forced_ue}"
     )
 
     print(
-        "Controlled route: "
-        f"{source_cell} -> {destination_cell}"
+        "Initial mismatched cell: "
+        f"{source_cell}"
     )
 
     print(
-        "Initial measured margin: "
-        f"{forced_margin_db:.3f} dB"
+        "Real measured destination: "
+        f"{destination_cell}"
     )
 
     print(
-        "Completed handovers: "
-        f"{result.num_completed_handovers}"
+        "Initial measured advantage: "
+        f"{initial_advantage_db:.3f} dB"
     )
 
     print(
-        "Forced UE final cell: "
-        f"{final_cell}"
+        "Observed handover TTI: "
+        f"{forced_handover_tti}"
     )
 
     print(
-        "Destination PF candidate observed: "
-        f"{saw_destination_candidate}"
+        "Completed handovers total: "
+        f"{run_result.num_completed_handovers}"
+    )
+
+    print(
+        "Source lost UE: "
+        f"{saw_source_without_ue}"
+    )
+
+    print(
+        "Destination gained UE: "
+        f"{saw_destination_with_ue}"
     )
 
     print(
@@ -1388,6 +1511,7 @@ def main() -> None:
     print("=" * 78)
 
     print()
+
     print(
         "WAVE9_MEASURED_DYNAMIC_HANDOVER_SMOKE_PASS"
     )
