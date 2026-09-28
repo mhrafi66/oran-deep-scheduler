@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from collections.abc import Callable
 from typing import Literal
 
 import torch
@@ -85,6 +86,12 @@ from oran_scheduler.simulator.tds_eligibility import (
     build_tds_eligibility,
 )
 
+from oran_scheduler.utils.perf_timing import (
+    perf_region,
+)
+
+
+
 PPOTrafficRewardPopulation = Literal[
     "candidates",
     "serving_ues",
@@ -137,9 +144,15 @@ class TrafficAwarePPOCellTTIStepResult:
         throughput.
 
         None during pre-collection warm-up because
-        no PPO transition is being collected and the
-        training-only counterfactual reward search is
-        intentionally skipped.
+        no PPO transition is being collected.
+
+    expert_labels:
+        PF-expert supervision generated for this
+        TTI when expert guidance is enabled.
+
+    num_expert_demonstrations_added:
+        Number of demonstrations committed to the
+        expert buffer.
 
     history_update:
         Next-TTI PF throughput history.
@@ -175,12 +188,23 @@ class TrafficAwarePPOCellTTIStepResult:
     )
 
     expert_labels: (
-        PPOPFExpertTTILabels | None
+        PPOPFExpertTTILabels
+        | None
     )
 
     num_expert_demonstrations_added: int
 
     history_update: CellThroughputHistoryUpdate
+
+    #
+    # When execution-time control modifies the
+    # actor's requested schedule, schedule contains
+    # the EXECUTED schedule while policy_schedule
+    # preserves the actor output.
+    #
+    policy_schedule: (
+        OneLDSScheduleResult | None
+    ) = None
 
 
 
@@ -217,6 +241,18 @@ class PreparedTrafficAwarePPOCellTTI:
     physical_inputs: PPOPhysicalScoreInputs
 
     first_decision: OneLDSDecisionData
+
+
+PPOExecutionScheduleTransform: TypeAlias = (
+    Callable[
+        [
+            int,
+            OneLDSScheduleResult,
+            PreparedTrafficAwarePPOCellTTI,
+        ],
+        OneLDSScheduleResult,
+    ]
+)
 
 
 
@@ -481,6 +517,117 @@ def _validate_physical_inputs(
         )
 
 
+def _apply_tds_eligibility_override(
+    *,
+    eligibility: TDSEligibilityData,
+    override_mask: torch.Tensor | None,
+) -> TDSEligibilityData:
+    """
+    Apply an external temporary scheduling gate.
+
+    Association validity remains unchanged.
+
+    The override can only REMOVE UEs from the
+    normal PF-TDS eligible population.
+
+    Intended examples:
+        - temporary UE unavailability
+        - admission/control gating
+        - transient scheduler-side exclusion
+
+    This is NOT reassociation.
+    """
+
+    if override_mask is None:
+        return eligibility
+
+    reference_mask = (
+        eligibility
+        .serving_ue_valid_mask
+    )
+
+    if tuple(
+        override_mask.shape
+    ) != tuple(
+        reference_mask.shape
+    ):
+        raise ValueError(
+            "tds_eligibility_override_mask must "
+            "match serving-UE layout."
+        )
+
+    if (
+        override_mask.dtype
+        != torch.bool
+    ):
+        raise ValueError(
+            "tds_eligibility_override_mask must "
+            "use torch.bool."
+        )
+
+    if (
+        override_mask.device
+        != reference_mask.device
+    ):
+        raise ValueError(
+            "tds_eligibility_override_mask is "
+            "on the wrong device."
+        )
+
+    #
+    # The environment may temporarily disable
+    # associated UEs, but it may never convert
+    # padding/non-associated slots into real UEs.
+    #
+    if torch.any(
+        override_mask
+        & ~reference_mask
+    ):
+        raise ValueError(
+            "TDS eligibility override cannot "
+            "enable an invalid serving-UE slot."
+        )
+
+    effective_mask = (
+        eligibility
+        .eligible_mask
+        & override_mask
+    )
+
+    return TDSEligibilityData(
+        serving_ue_valid_mask=(
+            eligibility
+            .serving_ue_valid_mask
+            .detach()
+            .clone()
+        ),
+
+        has_finite_buffer_data=(
+            eligibility
+            .has_finite_buffer_data
+            .detach()
+            .clone()
+        ),
+
+        eligible_mask=(
+            effective_mask
+            .detach()
+            .clone()
+        ),
+
+        num_valid_serving_ues=(
+            eligibility
+            .num_valid_serving_ues
+        ),
+
+        num_eligible_ues=int(
+            effective_mask
+            .sum()
+            .item()
+        ),
+    )
+
+
 def prepare_traffic_aware_ppo_cell_tti(
     *,
     tti_index: int,
@@ -498,6 +645,11 @@ def prepare_traffic_aware_ppo_cell_tti(
     packet_arrivals: (
         torch.Tensor | None
     ) = None,
+
+    tds_eligibility_override_mask: (
+        torch.Tensor | None
+    ) = None,
+
     device: str | torch.device = "cuda:0",
 ) -> PreparedTrafficAwarePPOCellTTI:
     """
@@ -587,6 +739,19 @@ def prepare_traffic_aware_ppo_cell_tti(
             tds_eligibility_config
         ),
     )
+
+    tds_eligibility = (
+        _apply_tds_eligibility_override(
+            eligibility=(
+                tds_eligibility
+            ),
+
+            override_mask=(
+                tds_eligibility_override_mask
+            ),
+        )
+    )
+
 
     prepared = state_manager.prepare_tti(
         tti_index=tti_index,
@@ -764,8 +929,21 @@ def run_traffic_aware_ppo_cell_tti_step(
     preparation: (
         PreparedTrafficAwarePPOCellTTI | None
     ) = None,
+
+    execution_schedule_transform: (
+        PPOExecutionScheduleTransform | None
+    ) = None,
+
     reward_reduction: PPORewardReduction = "mean",
-    packet_arrivals: torch.Tensor | None = None,
+
+    packet_arrivals: (
+        torch.Tensor | None
+    ) = None,
+
+    tds_eligibility_override_mask: (
+        torch.Tensor | None
+    ) = None,
+
     device: str | torch.device = "cuda:0",
 ) -> TrafficAwarePPOCellTTIStepResult:
     """
@@ -880,6 +1058,11 @@ def run_traffic_aware_ppo_cell_tti_step(
                 packet_arrivals=(
                     packet_arrivals
                 ),
+
+                tds_eligibility_override_mask=(
+                    tds_eligibility_override_mask
+                ),
+
                 device=device,
             )
         )
@@ -956,19 +1139,23 @@ def run_traffic_aware_ppo_cell_tti_step(
             .make_untracked_action_policy()
         )
 
-    schedule = run_1lds_user_slot_loop(
-        num_user_slots=(
-            training_controller
-            .config
-            .num_user_slots
-        ),
-        inputs=(
-            prepared.decision_inputs
-        ),
-        state_config=state_config,
-        action_policy=action_policy,
+    with perf_region(
+        "cell.schedule_actor",
         device=device,
-    )
+    ):
+        schedule = run_1lds_user_slot_loop(
+            num_user_slots=(
+                training_controller
+                .config
+                .num_user_slots
+            ),
+            inputs=(
+                prepared.decision_inputs
+            ),
+            state_config=state_config,
+            action_policy=action_policy,
+            device=device,
+        )
 
     #
     # The precomputed synchronization state must
@@ -1009,6 +1196,67 @@ def run_traffic_aware_ppo_cell_tti_step(
             "mask."
         )
 
+    policy_schedule = schedule
+
+    if (
+        execution_schedule_transform
+        is not None
+    ):
+        if collect_experience:
+            raise RuntimeError(
+                "Execution-time schedule transforms "
+                "are currently evaluation-only. "
+                "They cannot be enabled during "
+                "on-policy PPO collection."
+            )
+
+        transformed_schedule = (
+            execution_schedule_transform(
+                tti_index,
+                policy_schedule,
+                preparation,
+            )
+        )
+
+        if not isinstance(
+            transformed_schedule,
+            OneLDSScheduleResult,
+        ):
+            raise TypeError(
+                "execution_schedule_transform must "
+                "return OneLDSScheduleResult."
+            )
+
+        if (
+            transformed_schedule
+            .actions
+            .shape
+            != policy_schedule
+            .actions
+            .shape
+        ):
+            raise ValueError(
+                "Execution transform changed the "
+                "scheduler action tensor shape."
+            )
+
+        if (
+            transformed_schedule
+            .allocation
+            .candidate_by_user_slot
+            .shape
+            != policy_schedule
+            .allocation
+            .candidate_by_user_slot
+            .shape
+        ):
+            raise ValueError(
+                "Execution transform changed the "
+                "allocation shape."
+            )
+
+        schedule = transformed_schedule
+
     # ----------------------------------------------------------
     # SHARED COUNTERFACTUAL PHY CACHE
     #
@@ -1028,12 +1276,23 @@ def run_traffic_aware_ppo_cell_tti_step(
         | None
     ) = None
 
+    # if collect_experience:
+    #     shared_physical_scorer = (
+    #         CachedPPOPhysicalRBGScorer(
+    #             physical_inputs
+    #         )
+    #     )
+
     if collect_experience:
-        shared_physical_scorer = (
-            CachedPPOPhysicalRBGScorer(
-                physical_inputs
+        with perf_region(
+            "cell.scorer_init",
+            device=device,
+        ):
+            shared_physical_scorer = (
+                CachedPPOPhysicalRBGScorer(
+                    physical_inputs
+                )
             )
-        )
     # ----------------------------------------------------------
     # Teacher 2: PF expert supervision.
     #
@@ -1073,14 +1332,48 @@ def run_traffic_aware_ppo_cell_tti_step(
             shared_physical_scorer
             is not None
         )
+        with perf_region(
+            "cell.pf_expert",
+            device=device,
+        ):
+            expert_labels = (
+                generate_ppo_pf_expert_tti_labels(
+                    schedule=schedule,
+                    num_candidates=(
+                        state_config
+                        .num_candidates
+                    ),
+                    past_average_throughput=(
+                        prepared
+                        .decision_inputs
+                        .past_average_throughput
+                    ),
+                    candidate_valid_mask=(
+                        prepared
+                        .candidate_valid_mask
+                    ),
+                    score_rbg=(
+                        shared_physical_scorer
+                    ),
+                    config=(
+                        pf_expert_config
+                    ),
+                )
+            )
 
-        expert_labels = (
-            generate_ppo_pf_expert_tti_labels(
-                schedule=schedule,
-                num_candidates=(
-                    state_config
-                    .num_candidates
+    # ----------------------------------------------------------
+    # 4. Common PHY computes OFFERED service capacity.
+    # ----------------------------------------------------------
+    with perf_region(
+        "cell.physical_outcome",
+        device=device,
+    ):
+        physical_outcome = (
+            evaluate_ppo_physical_tti(
+                allocation=(
+                    schedule.allocation
                 ),
+                actions=schedule.actions,
                 past_average_throughput=(
                     prepared
                     .decision_inputs
@@ -1090,101 +1383,85 @@ def run_traffic_aware_ppo_cell_tti_step(
                     prepared
                     .candidate_valid_mask
                 ),
-                score_rbg=(
+                physical_inputs=(
+                    physical_inputs
+                ),
+                greedy_config=(
+                    greedy_config
+                ),
+                physical_scorer=(
                     shared_physical_scorer
                 ),
-                config=(
-                    pf_expert_config
+                run_counterfactual_greedy=(
+                    collect_experience
                 ),
             )
         )
-
-    # ----------------------------------------------------------
-    # 4. Common PHY computes OFFERED service capacity.
-    # ----------------------------------------------------------
-
-    physical_outcome = (
-        evaluate_ppo_physical_tti(
-            allocation=(
-                schedule.allocation
-            ),
-            actions=schedule.actions,
-            past_average_throughput=(
-                prepared
-                .decision_inputs
-                .past_average_throughput
-            ),
-            candidate_valid_mask=(
-                prepared
-                .candidate_valid_mask
-            ),
-            physical_inputs=(
-                physical_inputs
-            ),
-            greedy_config=(
-                greedy_config
-            ),
-            physical_scorer=(
-                shared_physical_scorer
-            ),
-            run_counterfactual_greedy=(
-                collect_experience
-            ),
-        )
-    )
 
     # ----------------------------------------------------------
     # 5. Candidate capacity -> persistent serving-UE order.
     # ----------------------------------------------------------
 
-    serving_offered_capacity_bps = (
-        _scatter_candidate_values_to_serving(
-            candidate_values=(
-                physical_outcome
-                .candidate_total_target_compliant_rate_bps
-            ),
-            candidate_serving_indices=(
-                prepared
-                .candidate_serving_indices
-            ),
-            candidate_valid_mask=(
-                prepared
-                .candidate_valid_mask
-            ),
-            num_serving_ues=(
-                num_serving_ues
-            ),
+    with perf_region(
+        "cell.traffic_delivery",
+        device=device,
+    ):
+        serving_offered_capacity_bps = (
+            _scatter_candidate_values_to_serving(
+                candidate_values=(
+                    physical_outcome
+                    .candidate_total_target_compliant_rate_bps
+                ),
+                candidate_serving_indices=(
+                    prepared
+                    .candidate_serving_indices
+                ),
+                candidate_valid_mask=(
+                    prepared
+                    .candidate_valid_mask
+                ),
+                num_serving_ues=(
+                    num_serving_ues
+                ),
+            )
         )
-    )
 
     # ----------------------------------------------------------
     # 6. Traffic model converts CAPACITY into DELIVERY.
     # ----------------------------------------------------------
-
-    traffic_service = (
-        traffic_manager.apply_service(
-            offered_service_capacity_bps=(
-                serving_offered_capacity_bps
+    with perf_region(
+        "cell.traffic_delivery",
+        device=device,
+    ):
+        traffic_service = (
+            traffic_manager.apply_service(
+                offered_service_capacity_bps=(
+                    serving_offered_capacity_bps
+                )
             )
         )
-    )
 
-    candidate_delivered_rate_bps = (
-        _gather_serving_values_to_candidates(
-            serving_values=(
-                traffic_service
-                .delivered_rate_bps
-            ),
-            candidate_serving_indices=(
-                prepared
-                .candidate_serving_indices
-            ),
-            candidate_valid_mask=(
-                prepared
-                .candidate_valid_mask
-            ),
+
+    with perf_region(
+        "cell.traffic_delivery",
+        device=device,
+    ):
+        candidate_delivered_rate_bps = (
+            _gather_serving_values_to_candidates(
+                serving_values=(
+                    traffic_service
+                    .delivered_rate_bps
+                ),
+                candidate_serving_indices=(
+                    prepared
+                    .candidate_serving_indices
+                ),
+                candidate_valid_mask=(
+                    prepared
+                    .candidate_valid_mask
+                ),
+            )
         )
-    )
 
     # # ----------------------------------------------------------
     # # 7. PPO reward uses ACTUAL delivered throughput.
@@ -1271,63 +1548,73 @@ def run_traffic_aware_ppo_cell_tti_step(
         | None
     ) = None
 
+    # ----------------------------------------------------------
+    # 7. PPO reward + trajectory completion.
+    # ----------------------------------------------------------
+
     if collect_experience:
-        reward = _resolve_traffic_reward(
-            physical_outcome=(
-                physical_outcome
-            ),
-            candidate_delivered_rate_bps=(
-                candidate_delivered_rate_bps
-            ),
-            candidate_valid_mask=(
-                prepared
-                .candidate_valid_mask
-            ),
-            serving_delivered_rate_bps=(
-                traffic_service
-                .delivered_rate_bps
-            ),
-            serving_valid_mask=(
-                scheduler_observation
-                .serving_ue_valid_mask
-            ),
-            reward_population=(
-                reward_population
-            ),
-            reward_config=reward_config,
-            reward_reduction=(
-                reward_reduction
-            ),
-        )
-
-        expected_reward_shape = (
-            training_controller
-            .config
-            .num_user_slots,
-            state_config.num_rbgs,
-        )
-
-        if tuple(
-            reward
-            .reward_data
-            .reward_by_layer_rbg
-            .shape
-        ) != expected_reward_shape:
-            raise RuntimeError(
-                "Traffic-aware PPO reward has the "
-                "wrong [user_slot, RBG] shape."
+        with perf_region(
+            "cell.reward",
+            device=device,
+        ):
+            reward = _resolve_traffic_reward(
+                physical_outcome=(
+                    physical_outcome
+                ),
+                candidate_delivered_rate_bps=(
+                    candidate_delivered_rate_bps
+                ),
+                candidate_valid_mask=(
+                    prepared
+                    .candidate_valid_mask
+                ),
+                serving_delivered_rate_bps=(
+                    traffic_service
+                    .delivered_rate_bps
+                ),
+                serving_valid_mask=(
+                    scheduler_observation
+                    .serving_ue_valid_mask
+                ),
+                reward_population=(
+                    reward_population
+                ),
+                reward_config=(
+                    reward_config
+                ),
+                reward_reduction=(
+                    reward_reduction
+                ),
             )
 
-        training_controller.finish_tti(
-            reward_by_rbg=(
+            expected_reward_shape = (
+                training_controller
+                .config
+                .num_user_slots,
+                state_config.num_rbgs,
+            )
+
+            if tuple(
                 reward
                 .reward_data
                 .reward_by_layer_rbg
-            ),
-            reduced_reward=(
-                reward.reduced_reward
-            ),
-        )
+                .shape
+            ) != expected_reward_shape:
+                raise RuntimeError(
+                    "Traffic-aware PPO reward has the "
+                    "wrong [user_slot, RBG] shape."
+                )
+
+            training_controller.finish_tti(
+                reward_by_rbg=(
+                    reward
+                    .reward_data
+                    .reward_by_layer_rbg
+                ),
+                reduced_reward=(
+                    reward.reduced_reward
+                ),
+            )
 
     # ----------------------------------------------------------
     # Algorithm 1:
@@ -1355,31 +1642,46 @@ def run_traffic_aware_ppo_cell_tti_step(
         #         ),
         #     )
         # )
-
-        num_expert_demonstrations_added = (
-            commit_ppo_pf_expert_tti_labels(
-                labels=expert_labels,
-                expert_buffer=expert_buffer,
-                augmentation_config=(
-                    candidate_augmentation_config
-                ),
-                augmentation_generator=(
-                    candidate_augmentation_generator
-                ),
+        with perf_region(
+            "cell.expert_commit",
+            device=device,
+        ):
+            num_expert_demonstrations_added = (
+                commit_ppo_pf_expert_tti_labels(
+                    labels=expert_labels,
+                    expert_buffer=expert_buffer,
+                    augmentation_config=(
+                        candidate_augmentation_config
+                    ),
+                    augmentation_generator=(
+                        candidate_augmentation_generator
+                    ),
+                )
             )
-        )
 
     # ----------------------------------------------------------
     # 9. Actual delivery updates PF history.
     # ----------------------------------------------------------
 
-    history_update = (
-        state_manager.complete_tti(
-            candidate_delivered_rate_bps=(
-                candidate_delivered_rate_bps
+    # history_update = (
+    #     state_manager.complete_tti(
+    #         candidate_delivered_rate_bps=(
+    #             candidate_delivered_rate_bps
+    #         )
+    #     )
+    # )
+
+    with perf_region(
+        "cell.history_update",
+        device=device,
+    ):
+        history_update = (
+            state_manager.complete_tti(
+                candidate_delivered_rate_bps=(
+                    candidate_delivered_rate_bps
+                )
             )
         )
-    )
 
     return TrafficAwarePPOCellTTIStepResult(
         traffic_start=traffic_start,
@@ -1412,6 +1714,15 @@ def run_traffic_aware_ppo_cell_tti_step(
         ),
         history_update=(
             history_update
+        ),
+
+        policy_schedule=(
+            policy_schedule
+            if (
+                execution_schedule_transform
+                is not None
+            )
+            else None
         ),
     )
 

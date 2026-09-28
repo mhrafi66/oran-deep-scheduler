@@ -362,6 +362,49 @@ def test_physical_scorer_forwards_local_ue_mapping(
 
     base = build_inputs()
 
+    #
+    # This test uses three explicit local PHY UE
+    # mappings:
+    #
+    #     candidate 0 -> PHY UE 0
+    #     candidate 1 -> PHY UE 1
+    #     candidate 2 -> PHY UE 2
+    #
+    # The generic build_inputs() fixture contains only
+    # one dummy PHY UE because older scorer tests
+    # monkeypatch the actual PHY evaluator.
+    #
+    # Candidate-PHY precomputation now legitimately
+    # requires the synthetic channel tensors to expose
+    # those three physical UE rows.
+    #
+    h_freq = base.h_freq.repeat(
+        1,
+        3,
+        1,
+        1,
+        1,
+        1,
+        1,
+    )
+
+    recommended_rank = (
+        base.recommended_rank.repeat(
+            1,
+            3,
+        )
+    )
+
+    rx_combiners = (
+        base.rx_combiners.repeat(
+            1,
+            3,
+            1,
+            1,
+            1,
+        )
+    )
+
     inputs = PPOPhysicalScoreInputs(
         candidate_global_ue_indices=(
             torch.tensor(
@@ -385,18 +428,18 @@ def test_physical_scorer_forwards_local_ue_mapping(
             )
         ),
 
-        h_freq=base.h_freq,
+        h_freq=h_freq,
 
         serving_cell_index=(
             base.serving_cell_index
         ),
 
         recommended_rank=(
-            base.recommended_rank
+            recommended_rank
         ),
 
         rx_combiners=(
-            base.rx_combiners
+            rx_combiners
         ),
 
         csi_subcarrier_index=(
@@ -475,3 +518,137 @@ def test_physical_scorer_forwards_local_ue_mapping(
             dtype=torch.long,
         ),
     )
+
+
+def test_chunked_physical_scorer_precomputes_candidate_phy():
+    num_candidates = 3
+    num_rx = 2
+    num_bs = 2
+    num_tx = 4
+    num_subcarriers = 12
+
+    h_freq = torch.randn(
+        (
+            1,
+            num_candidates,
+            num_rx,
+            num_bs,
+            num_tx,
+            1,
+            num_subcarriers,
+        ),
+        dtype=torch.complex64,
+    )
+
+    inputs = PPOPhysicalScoreInputs(
+        candidate_global_ue_indices=(
+            torch.tensor(
+                [
+                    101,
+                    205,
+                    317,
+                ],
+                dtype=torch.long,
+            )
+        ),
+
+        candidate_physical_ue_indices=(
+            torch.tensor(
+                [
+                    0,
+                    1,
+                    2,
+                ],
+                dtype=torch.long,
+            )
+        ),
+
+        h_freq=h_freq,
+
+        serving_cell_index=0,
+
+        recommended_rank=torch.ones(
+            (
+                1,
+                num_candidates,
+            ),
+            dtype=torch.long,
+        ),
+
+        rx_combiners=torch.ones(
+            (
+                1,
+                num_candidates,
+                1,
+                2,
+                num_rx,
+            ),
+            dtype=torch.complex64,
+        ),
+
+        csi_subcarrier_index=0,
+
+        subcarriers_per_rbg=12,
+
+        tx_power_per_subcarrier_w=1.0,
+
+        noise_power_per_subcarrier_w=1.0e-3,
+
+        link_adaptation_config=(
+            LinkAdaptationConfig(
+                num_rbgs=1,
+                device="cpu",
+            )
+        ),
+
+        rate_config=(
+            RateConfig(
+                device="cpu",
+            )
+        ),
+    )
+
+    scorer = CachedPPOPhysicalRBGScorer(
+        inputs
+    )
+
+    serving = (
+        scorer
+        .precomputed_candidate_serving_channel
+    )
+
+    covariance = (
+        scorer
+        .precomputed_candidate_inter_cell_covariance
+    )
+
+    assert serving is not None
+    assert covariance is not None
+
+    assert tuple(
+        serving.shape
+    ) == (
+        num_candidates,
+        1,
+        num_subcarriers,
+        num_rx,
+        num_tx,
+    )
+
+    assert tuple(
+        covariance.shape
+    ) == (
+        num_candidates,
+        1,
+        num_subcarriers,
+        num_rx,
+        num_rx,
+    )
+
+    assert torch.isfinite(
+        serving.real
+    ).all()
+
+    assert torch.isfinite(
+        covariance.real
+    ).all()

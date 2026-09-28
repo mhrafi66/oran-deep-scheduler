@@ -1,3 +1,9 @@
+from oran_scheduler.phy.rank_diagnostic import (
+    compute_ideal_svd_rank_diagnostic,
+)
+from oran_scheduler.phy.csi import (
+    compute_ideal_svd_csi,
+)
 import torch
 
 from oran_scheduler.phy.link_adaptation import (
@@ -508,4 +514,221 @@ def test_complete_single_user_phy_reports():
     ).all()
 
 
+def test_precomputed_ri_phy_matches_legacy_su_reports():
+    """
+    RI already computes the serving channel and
+    inter-cell RX covariance.
+
+    Reusing those tensors in the SU-MIMO report path
+    must produce the same physical result as the
+    legacy path that reconstructs them from h_freq.
+    """
+
+    device = (
+        "cuda:0"
+        if torch.cuda.is_available()
+        else "cpu"
+    )
+
+    torch.manual_seed(
+        20260914
+    )
+
+    num_ues = 2
+    num_bs = 2
+    num_rx = 2
+    num_tx = 4
+    num_rbgs = 2
+    subcarriers_per_rbg = 12
+
+    real = torch.randn(
+        (
+            1,
+            num_ues,
+            num_rx,
+            num_bs,
+            num_tx,
+            1,
+            num_rbgs
+            * subcarriers_per_rbg,
+        ),
+        dtype=torch.float32,
+        device=device,
+    )
+
+    imag = torch.randn_like(
+        real
+    )
+
+    h_freq = torch.complex(
+        real,
+        imag,
+    )
+
+    serving_bs = torch.tensor(
+        [
+            [
+                0,
+                1,
+            ]
+        ],
+        dtype=torch.long,
+        device=device,
+    )
+
+    tx_power = torch.tensor(
+        2.0,
+        dtype=torch.float32,
+        device=device,
+    )
+
+    noise_power = torch.tensor(
+        1.0e-2,
+        dtype=torch.float32,
+        device=device,
+    )
+
+    rank_data = (
+        compute_ideal_svd_rank_diagnostic(
+            h_freq=h_freq,
+            serving_bs=serving_bs,
+            num_rbgs=num_rbgs,
+            tx_power_per_subcarrier_w=(
+                tx_power
+            ),
+            noise_power_per_subcarrier_w=(
+                noise_power
+            ),
+        )
+    )
+
+    csi_data = compute_ideal_svd_csi(
+        h_serving_rbg=(
+            rank_data
+            .h_serving_rbg
+        ),
+        rank1_rbg_score=(
+            rank_data
+            .rank1_rbg_spectral_efficiency
+        ),
+        rank2_rbg_score=(
+            rank_data
+            .rank2_rbg_spectral_efficiency
+        ),
+    )
+
+    link_config = LinkAdaptationConfig(
+        num_rbgs=num_rbgs,
+        device=device,
+    )
+
+    rate_config = RateConfig(
+        device=device,
+    )
+
+    legacy = build_single_user_phy_reports(
+        h_freq=h_freq,
+        serving_bs=serving_bs,
+        recommended_rank=(
+            csi_data
+            .recommended_rank
+        ),
+        precoder_directions=(
+            csi_data
+            .precoder_directions
+        ),
+        num_rbgs=num_rbgs,
+        subcarriers_per_rbg=(
+            subcarriers_per_rbg
+        ),
+        tx_power_per_subcarrier_w=(
+            tx_power
+        ),
+        noise_power_per_subcarrier_w=(
+            noise_power
+        ),
+        link_adaptation_config=(
+            link_config
+        ),
+        rate_config=rate_config,
+    )
+
+    optimized = build_single_user_phy_reports(
+        h_freq=h_freq,
+        serving_bs=serving_bs,
+        recommended_rank=(
+            csi_data
+            .recommended_rank
+        ),
+        precoder_directions=(
+            csi_data
+            .precoder_directions
+        ),
+        num_rbgs=num_rbgs,
+        subcarriers_per_rbg=(
+            subcarriers_per_rbg
+        ),
+        tx_power_per_subcarrier_w=(
+            tx_power
+        ),
+        noise_power_per_subcarrier_w=(
+            noise_power
+        ),
+        link_adaptation_config=(
+            link_config
+        ),
+        rate_config=rate_config,
+        precomputed_serving_channel=(
+            rank_data
+            .h_serving_rbg
+        ),
+        precomputed_inter_cell_covariance=(
+            rank_data
+            .inter_cell_covariance
+        ),
+    )
+
+    torch.testing.assert_close(
+        optimized
+        .sinr
+        .desired_power,
+        legacy
+        .sinr
+        .desired_power,
+        rtol=1.0e-5,
+        atol=1.0e-6,
+    )
+
+    torch.testing.assert_close(
+        optimized
+        .sinr
+        .inter_cell_interference_power,
+        legacy
+        .sinr
+        .inter_cell_interference_power,
+        rtol=1.0e-5,
+        atol=1.0e-6,
+    )
+
+    torch.testing.assert_close(
+        optimized
+        .sinr
+        .sinr_linear,
+        legacy
+        .sinr
+        .sinr_linear,
+        rtol=1.0e-5,
+        atol=1.0e-6,
+    )
+
+    torch.testing.assert_close(
+        optimized
+        .rate
+        .target_compliant_rate_bps,
+        legacy
+        .rate
+        .target_compliant_rate_bps,
+        rtol=1.0e-5,
+        atol=1.0e-4,
+    )
 

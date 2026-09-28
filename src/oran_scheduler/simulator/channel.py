@@ -237,6 +237,235 @@ def attach_topology_to_channel(
         topology.bs_virtual_loc,
     )
 
+
+class FrequencyChannelRuntime:
+    """
+    Reusable Sionna frequency-channel runtime.
+
+    The expensive configuration-invariant objects are
+    constructed once:
+
+        PanelArray
+        ResourceGrid
+        UMa
+        GenerateOFDMChannel
+
+    For every channel realization we only:
+
+        1. reset the deterministic channel seed
+        2. attach the requested topology
+        3. generate a fresh frequency-domain channel
+
+    OPEN-REPRODUCTION ENGINEERING:
+        This changes object lifetime only.
+
+        It must not change:
+            - topology
+            - channel model
+            - antenna configuration
+            - random seed
+            - generated channel semantics
+    """
+
+    def __init__(
+        self,
+        *,
+        config: ChannelConfig,
+    ) -> None:
+        self.config = config
+
+        (
+            self.bs_array,
+            self.ut_array,
+        ) = create_channel_arrays(
+            config
+        )
+
+        self.resource_grid = (
+            create_training_resource_grid(
+                config
+            )
+        )
+
+        self.channel_model = (
+            create_uma_channel_model(
+                config=config,
+                bs_array=self.bs_array,
+                ut_array=self.ut_array,
+            )
+        )
+
+        self.channel_generator = (
+            GenerateOFDMChannel(
+                channel_model=(
+                    self.channel_model
+                ),
+                resource_grid=(
+                    self.resource_grid
+                ),
+                precision=config.precision,
+                device=config.device,
+            )
+        )
+
+        self._num_generations = 0
+        #
+        # Sionna freezes topology tensor shapes after
+        # the first set_topology() call.
+        #
+        # We therefore track:
+        #
+        #     batch size
+        #     number of UEs
+        #     number of BSs
+        #
+        # and reset only when one of those dimensions
+        # changes.
+        #
+        self._topology_shape: (
+            tuple[int, int, int]
+            | None
+        ) = None
+
+        self._num_topology_resets = 0
+
+
+    @property
+    def num_generations(
+        self,
+    ) -> int:
+        return self._num_generations
+
+
+    @property
+    def num_topology_resets(
+        self,
+    ) -> int:
+        return self._num_topology_resets
+
+    def generate(
+        self,
+        *,
+        topology: TopologyData,
+        seed: int,
+        batch_size: int,
+    ) -> ChannelData:
+        """
+        Generate one fresh channel realization while
+        reusing the invariant Sionna objects.
+
+        Sionna freezes the topology tensor shapes after
+        the first set_topology() call.
+
+        Therefore:
+
+            same shape
+                ->
+            update topology in-place
+
+            changed batch/UE/BS count
+                ->
+            reset_topology()
+                ->
+            attach new topology
+
+        This preserves persistent object reuse while
+        supporting variable-size UE microbatches.
+        """
+
+        if batch_size <= 0:
+            raise ValueError(
+                "batch_size must be positive."
+            )
+
+        topology_batch_size = int(
+            topology.ut_loc.shape[0]
+        )
+
+        num_topology_ues = int(
+            topology.ut_loc.shape[1]
+        )
+
+        num_topology_bs = int(
+            topology.bs_loc.shape[1]
+        )
+
+        topology_shape = (
+            topology_batch_size,
+            num_topology_ues,
+            num_topology_bs,
+        )
+
+        if batch_size != topology_batch_size:
+            raise ValueError(
+                "Requested channel batch size does not "
+                "match the topology batch dimension."
+            )
+
+        #
+        # Sionna's topology buffers are shape-frozen
+        # after first use.
+        #
+        # A reset is required only when one of the
+        # topology dimensions changes.
+        #
+        if (
+            self._topology_shape is not None
+            and topology_shape
+            != self._topology_shape
+        ):
+            self.channel_model.reset_topology()
+
+            self._num_topology_resets += 1
+
+        #
+        # Preserve deterministic channel-generation
+        # semantics from generate_frequency_channel().
+        #
+        set_channel_seed(
+            seed
+        )
+
+        attach_topology_to_channel(
+            channel_model=(
+                self.channel_model
+            ),
+            topology=topology,
+        )
+
+        #
+        # After set_topology() succeeds, this is now
+        # the shape frozen inside Sionna.
+        #
+        self._topology_shape = (
+            topology_shape
+        )
+
+        h_freq = (
+            self.channel_generator(
+                batch_size
+            )
+        )
+
+        self._num_generations += 1
+
+        return ChannelData(
+            resource_grid=(
+                self.resource_grid
+            ),
+            bs_array=(
+                self.bs_array
+            ),
+            ut_array=(
+                self.ut_array
+            ),
+            channel_model=(
+                self.channel_model
+            ),
+            h_freq=h_freq,
+        )
+
+
 def generate_frequency_channel(
         topology: TopologyData,
         topology_config: TopologyConfig,

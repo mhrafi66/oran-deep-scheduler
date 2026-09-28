@@ -103,6 +103,14 @@ def compute_single_user_layer_sinr(
     subcarriers_per_rbg: int,
     tx_power_per_subcarrier_w: float | torch.Tensor,
     noise_power_per_subcarrier_w: float | torch.Tensor,
+
+    precomputed_serving_channel: (
+        torch.Tensor | None
+    ) = None,
+
+    precomputed_inter_cell_covariance: (
+        torch.Tensor | None
+    ) = None,
 ) -> SingleUserLayerSINRData:
     """
     Evaluate every UE independently on every RBG.
@@ -221,62 +229,172 @@ def compute_single_user_layer_sinr(
         )
 
 
-    all_bs_rbg_channel = h_freq.reshape(
-        batch_size,
-        num_ues,
-        num_rx_ant,
-        num_bs,
-        num_tx_ant,
-        num_symbols,
-        num_rbgs,
-        subcarriers_per_rbg,
+    # ==========================================================
+    # REUSE RI-STAGE PHY INTERMEDIATES WHEN AVAILABLE
+    # ==========================================================
+
+    has_precomputed_serving = (
+        precomputed_serving_channel
+        is not None
     )
 
-    all_bs_rbg_channel = (
-        all_bs_rbg_channel.permute(
-            0,
-            1,
-            6,
-            5,
-            7,
-            3,
-            2,
-            4,
+    has_precomputed_covariance = (
+        precomputed_inter_cell_covariance
+        is not None
+    )
+
+    if (
+        has_precomputed_serving
+        != has_precomputed_covariance
+    ):
+        raise ValueError(
+            "Precomputed serving channel and "
+            "inter-cell covariance must either both "
+            "be provided or both be None."
         )
-        .contiguous()
-    )
 
-    serving_index = (
-        serving_bs[
-            :,
-            :,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        ]
-        .expand(
+    all_bs_rbg_channel: (
+        torch.Tensor | None
+    ) = None
+
+    inter_cell_covariance: (
+        torch.Tensor | None
+    ) = None
+
+    if has_precomputed_serving:
+
+        assert (
+            precomputed_serving_channel
+            is not None
+        )
+
+        assert (
+            precomputed_inter_cell_covariance
+            is not None
+        )
+
+        expected_serving_shape = (
             batch_size,
             num_ues,
             num_rbgs,
             num_symbols,
             subcarriers_per_rbg,
-            1,
             num_rx_ant,
             num_tx_ant,
         )
-    )
 
-    serving_channel = torch.gather(
-        all_bs_rbg_channel,
-        dim=5,
-        index=serving_index,
-    ).squeeze(
-        dim=5
-    )
+        expected_covariance_shape = (
+            batch_size,
+            num_ues,
+            num_rbgs,
+            num_symbols,
+            subcarriers_per_rbg,
+            num_rx_ant,
+            num_rx_ant,
+        )
 
+        if tuple(
+            precomputed_serving_channel.shape
+        ) != expected_serving_shape:
+            raise ValueError(
+                "Unexpected precomputed serving-"
+                "channel shape."
+            )
+
+        if tuple(
+            precomputed_inter_cell_covariance.shape
+        ) != expected_covariance_shape:
+            raise ValueError(
+                "Unexpected precomputed inter-cell "
+                "covariance shape."
+            )
+
+        if (
+            precomputed_serving_channel.device
+            != h_freq.device
+        ):
+            raise ValueError(
+                "Precomputed serving channel is on "
+                "the wrong device."
+            )
+
+        if (
+            precomputed_inter_cell_covariance.device
+            != h_freq.device
+        ):
+            raise ValueError(
+                "Precomputed covariance is on the "
+                "wrong device."
+            )
+
+        serving_channel = (
+            precomputed_serving_channel
+        )
+
+        inter_cell_covariance = (
+            precomputed_inter_cell_covariance
+        )
+
+    else:
+
+        #
+        # Legacy/reference route.
+        #
+        all_bs_rbg_channel = h_freq.reshape(
+            batch_size,
+            num_ues,
+            num_rx_ant,
+            num_bs,
+            num_tx_ant,
+            num_symbols,
+            num_rbgs,
+            subcarriers_per_rbg,
+        )
+
+        all_bs_rbg_channel = (
+            all_bs_rbg_channel.permute(
+                0,
+                1,
+                6,
+                5,
+                7,
+                3,
+                2,
+                4,
+            )
+            .contiguous()
+        )
+
+        serving_index = (
+            serving_bs[
+                :,
+                :,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ]
+            .expand(
+                batch_size,
+                num_ues,
+                num_rbgs,
+                num_symbols,
+                subcarriers_per_rbg,
+                1,
+                num_rx_ant,
+                num_tx_ant,
+            )
+        )
+
+        serving_channel = torch.gather(
+            all_bs_rbg_channel,
+            dim=5,
+            index=serving_index,
+        ).squeeze(
+            dim=5
+        )
     layer_numbers = torch.arange(
         2,
         dtype=torch.long,
@@ -497,72 +615,115 @@ def compute_single_user_layer_sinr(
         - desired_power
     )
 
-    projected_all_bs = torch.einsum(
-        "bugsflr,bugsfqrt->bugsflqt",
-        mrc_combiner.conj(),
-        all_bs_rbg_channel,
-    )
+    # ==========================================================
+    # INTER-CELL INTERFERENCE
+    # ==========================================================
+    #
+    # If RI already calculated:
+    #
+    #     C = sum_b!=serving
+    #         P_port H_b H_b^H
+    #
+    # then the MRC-projected interference is simply:
+    #
+    #     w^H C w
+    #
+    # This is algebraically identical to explicitly
+    # projecting every interfering BS/TX port again.
+    #
 
-    interfering_power_per_tx_port = (
-        total_tx_power
-        / float(
-            num_tx_ant
+    if inter_cell_covariance is not None:
+
+        inter_cell_interference_power = (
+            torch.einsum(
+                "bugsflr,bugsfrq,bugsflq->bugsfl",
+                mrc_combiner.conj(),
+                inter_cell_covariance,
+                mrc_combiner,
+            )
+            .real
         )
-    )
 
-    interference_by_bs = (
-        torch.abs(
-            projected_all_bs
-        ) ** 2
-    ).sum(
-        dim=-1
-    )
+        inter_cell_interference_power = (
+            torch.clamp(
+                inter_cell_interference_power,
+                min=0.0,
+            )
+        )
 
-    interference_by_bs = (
-        interference_by_bs
-        * interfering_power_per_tx_port
-    )
+    else:
 
-    bs_indices = torch.arange(
-        num_bs,
-        dtype=torch.long,
-        device=h_freq.device,
-    )
+        assert (
+            all_bs_rbg_channel
+            is not None
+        )
 
-    interfering_bs_mask = (
-        bs_indices[
-            None,
-            None,
-            :,
-        ]
-        != serving_bs[
-            :,
-            :,
-            None,
-        ]
-    )
+        projected_all_bs = torch.einsum(
+            "bugsflr,bugsfqrt->bugsflqt",
+            mrc_combiner.conj(),
+            all_bs_rbg_channel,
+        )
 
-    interference_by_bs = torch.where(
-        interfering_bs_mask[
-            :,
-            :,
-            None,
-            None,
-            None,
-            None,
-            :,
-        ],
-        interference_by_bs,
-        torch.zeros_like(
-            interference_by_bs
-        ),
-    )
+        interfering_power_per_tx_port = (
+            total_tx_power
+            / float(
+                num_tx_ant
+            )
+        )
 
-    inter_cell_interference_power = (
-        interference_by_bs.sum(
+        interference_by_bs = (
+            torch.abs(
+                projected_all_bs
+            ) ** 2
+        ).sum(
             dim=-1
         )
-    )
+
+        interference_by_bs = (
+            interference_by_bs
+            * interfering_power_per_tx_port
+        )
+
+        bs_indices = torch.arange(
+            num_bs,
+            dtype=torch.long,
+            device=h_freq.device,
+        )
+
+        interfering_bs_mask = (
+            bs_indices[
+                None,
+                None,
+                :,
+            ]
+            != serving_bs[
+                :,
+                :,
+                None,
+            ]
+        )
+
+        interference_by_bs = torch.where(
+            interfering_bs_mask[
+                :,
+                :,
+                None,
+                None,
+                None,
+                None,
+                :,
+            ],
+            interference_by_bs,
+            torch.zeros_like(
+                interference_by_bs
+            ),
+        )
+
+        inter_cell_interference_power = (
+            interference_by_bs.sum(
+                dim=-1
+            )
+        )
 
     noise_power_scalar = torch.as_tensor(
         noise_power_per_subcarrier_w,
@@ -945,6 +1106,14 @@ def build_single_user_phy_reports(
     noise_power_per_subcarrier_w: float | torch.Tensor,
     link_adaptation_config: LinkAdaptationConfig,
     rate_config: RateConfig,
+
+    precomputed_serving_channel: (
+        torch.Tensor | None
+    ) = None,
+
+    precomputed_inter_cell_covariance: (
+        torch.Tensor | None
+    ) = None,
 ) -> SingleUserPHYReportData:
     """
     Generate all SU-MIMO physical scheduler reports in one
@@ -967,6 +1136,13 @@ def build_single_user_phy_reports(
         ),
         noise_power_per_subcarrier_w=(
             noise_power_per_subcarrier_w
+        ),
+        precomputed_serving_channel=(
+            precomputed_serving_channel
+        ),
+
+        precomputed_inter_cell_covariance=(
+            precomputed_inter_cell_covariance
         ),
     )
 

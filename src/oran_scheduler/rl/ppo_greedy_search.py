@@ -342,6 +342,220 @@ def _validate_layer_search_inputs(
             "masked for the current user layer."
         )
 
+def _evaluate_ppo_layer_greedy_search_batched(
+    *,
+    allocation: CellAllocation,
+    user_slot_index: int,
+    chosen_actions: torch.Tensor,
+    num_candidates: int,
+    past_average_throughput: torch.Tensor,
+    legal_action_mask: torch.Tensor,
+    score_many_pf,
+    config: PPOGreedySearchConfig,
+) -> PPOLayerGreedySearchData:
+    """
+    GPU-batched equivalent of the PPO counterfactual
+    greedy reward judge.
+    """
+
+    device = (
+        allocation
+        .candidate_by_user_slot
+        .device
+    )
+
+    dtype = (
+        past_average_throughput.dtype
+    )
+
+    num_rbgs = (
+        allocation.num_rbgs
+    )
+
+    previous_allocation_cpu = (
+        allocation
+        .candidate_by_user_slot[
+            :user_slot_index,
+            :,
+        ]
+        .detach()
+        .cpu()
+    )
+
+    legal_action_mask_cpu = (
+        legal_action_mask
+        .detach()
+        .cpu()
+    )
+
+    requests: list[
+        tuple[
+            tuple[int, ...],
+            int,
+        ]
+    ] = []
+
+    request_rbg: list[int] = []
+
+    request_action: list[int] = []
+
+    for rbg_index in range(
+        num_rbgs
+    ):
+        previous_candidates = tuple(
+            int(value)
+            for value
+            in (
+                previous_allocation_cpu[
+                    :,
+                    rbg_index,
+                ]
+                .tolist()
+            )
+            if int(value)
+            != NO_ALLOCATION
+        )
+
+        #
+        # Score every legal action exactly once.
+        #
+        # This includes the actor's chosen action.
+        #
+        for action in range(
+            num_candidates + 1
+        ):
+            if not bool(
+                legal_action_mask_cpu[
+                    rbg_index,
+                    action,
+                ]
+            ):
+                continue
+
+            if action == num_candidates:
+                hypothetical_candidates = (
+                    previous_candidates
+                )
+
+            else:
+                hypothetical_candidates = (
+                    previous_candidates
+                    + (
+                        action,
+                    )
+                )
+
+            requests.append(
+                (
+                    hypothetical_candidates,
+                    rbg_index,
+                )
+            )
+
+            request_rbg.append(
+                rbg_index
+            )
+
+            request_action.append(
+                action
+            )
+
+    with torch.no_grad():
+        pf_values = score_many_pf(
+            requests,
+            past_average_throughput=(
+                past_average_throughput
+            ),
+            denominator_epsilon=(
+                config
+                .pf_denominator_epsilon
+            ),
+        )
+
+    if not torch.all(
+        torch.isfinite(
+            pf_values
+        )
+    ):
+        raise ValueError(
+            "PPO greedy-search PF score is "
+            "non-finite."
+        )
+
+    pf_matrix = torch.full(
+        (
+            num_rbgs,
+            num_candidates + 1,
+        ),
+        fill_value=float(
+            "-inf"
+        ),
+        dtype=dtype,
+        device=device,
+    )
+
+    request_rbg_tensor = torch.tensor(
+        request_rbg,
+        dtype=torch.long,
+        device=device,
+    )
+
+    request_action_tensor = torch.tensor(
+        request_action,
+        dtype=torch.long,
+        device=device,
+    )
+
+    pf_matrix[
+        request_rbg_tensor,
+        request_action_tensor,
+    ] = pf_values
+
+    rbg_indices = torch.arange(
+        num_rbgs,
+        dtype=torch.long,
+        device=device,
+    )
+
+    chosen_pf_sum = (
+        pf_matrix[
+            rbg_indices,
+            chosen_actions,
+        ]
+    )
+
+    best_pf_sum = torch.max(
+        pf_matrix,
+        dim=1,
+    ).values
+
+    required_pf = (
+        chosen_pf_sum
+        + config.pf_comparison_epsilon
+    )
+
+    better_allocation_exists = (
+        best_pf_sum
+        > required_pf
+    )
+
+    return PPOLayerGreedySearchData(
+        better_allocation_exists=(
+            better_allocation_exists
+        ),
+        chosen_pf_sum=(
+            chosen_pf_sum
+        ),
+        best_pf_sum=(
+            best_pf_sum
+        ),
+        num_phy_evaluations=(
+            len(
+                requests
+            )
+        ),
+    )
+
 
 def evaluate_ppo_layer_greedy_search(
     *,
@@ -427,6 +641,40 @@ def evaluate_ppo_layer_greedy_search(
             ),
         )
     )
+
+    score_many_pf = getattr(
+        score_rbg,
+        "score_many_pf",
+        None,
+    )
+
+    if callable(
+        score_many_pf
+    ):
+        return (
+            _evaluate_ppo_layer_greedy_search_batched(
+                allocation=allocation,
+                user_slot_index=(
+                    user_slot_index
+                ),
+                chosen_actions=(
+                    chosen_actions
+                ),
+                num_candidates=(
+                    num_candidates
+                ),
+                past_average_throughput=(
+                    past_average_throughput
+                ),
+                legal_action_mask=(
+                    legal_action_mask
+                ),
+                score_many_pf=(
+                    score_many_pf
+                ),
+                config=config,
+            )
+        )
 
     num_phy_evaluations = 0
 

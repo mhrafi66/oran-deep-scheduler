@@ -36,6 +36,26 @@ class IdealSVDRankData:
         [batch, UE, RBG], values 1 or 2
     """
 
+    #
+    # Reusable PHY intermediates.
+    #
+    # h_serving_rbg:
+    #
+    #   [batch, UE, RBG, symbol, subcarrier, RX, TX]
+    #
+    # inter_cell_covariance:
+    #
+    #   [batch, UE, RBG, symbol, subcarrier, RX, RX]
+    #
+    # These quantities are already computed while
+    # deriving RI. Retaining them avoids reconstructing
+    # exactly the same PHY information later.
+    #
+
+    h_serving_rbg: torch.Tensor
+
+    inter_cell_covariance: torch.Tensor
+
     spatial_mode_power: torch.Tensor
     interference_power_per_mode: torch.Tensor
 
@@ -393,7 +413,17 @@ def compute_ideal_svd_rank_diagnostic(
     )
 
     return IdealSVDRankData(
-        spatial_mode_power=spatial_mode_power,
+        h_serving_rbg=(
+            h_serving
+        ),
+
+        inter_cell_covariance=(
+            inter_cell_covariance
+        ),
+
+        spatial_mode_power=(
+            spatial_mode_power
+        ),
         interference_power_per_mode=(
             interference_power_per_mode
         ),

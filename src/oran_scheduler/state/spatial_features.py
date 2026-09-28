@@ -4,10 +4,9 @@ import torch
 
 from oran_scheduler.schedulers.allocation import (
     CellAllocation,
-    selected_candidates_for_rbg,
+    NO_ALLOCATION,
     validate_cell_allocation,
 )
-
 
 @dataclass
 class SpatialAllocationFeatures:
@@ -138,14 +137,39 @@ def compute_max_precoder_cross_correlation(
     Returns:
         [candidate, RBG]
 
+    PERFORMANCE IMPLEMENTATION
+    --------------------------
+    The original implementation used nested Python
+    loops:
+
+        RBG
+          -> candidate
+              -> scheduled candidate
+
+    and repeatedly called .item() on CUDA tensors.
+
+    This implementation evaluates every:
+
+        RBG
+        x candidate
+        x scheduled candidate
+        x candidate stream
+        x scheduled stream
+
+    simultaneously on the GPU.
+
+    The mathematical definition is unchanged.
+
     Reproduction substitution:
-        The supplied precoder directions currently come from
-        our ideal-SVD CSI surrogate rather than quantized PMI.
+        The supplied precoder directions currently come
+        from our ideal-SVD CSI surrogate rather than
+        quantized PMI.
     """
 
     if candidate_rank.ndim != 1:
         raise ValueError(
-            "candidate_rank must have shape [candidate]."
+            "candidate_rank must have shape "
+            "[candidate]."
         )
 
     num_candidates = int(
@@ -157,9 +181,13 @@ def compute_max_precoder_cross_correlation(
         num_candidates=num_candidates,
     )
 
-    if candidate_precoder_directions.ndim != 4:
+    if (
+        candidate_precoder_directions.ndim
+        != 4
+    ):
         raise ValueError(
-            "candidate_precoder_directions must have shape "
+            "candidate_precoder_directions must have "
+            "shape "
             "[candidate, RBG, mode, TX_ant]."
         )
 
@@ -208,11 +236,14 @@ def compute_max_precoder_cross_correlation(
         candidate_precoder_directions.device
     )
 
-    valid_mask = (
-        candidate_valid_mask.to(
-            device=device,
-            dtype=torch.bool,
-        )
+    valid_mask = candidate_valid_mask.to(
+        device=device,
+        dtype=torch.bool,
+    )
+
+    ranks = candidate_rank.to(
+        device=device,
+        dtype=torch.long,
     )
 
     max_available_modes = int(
@@ -221,11 +252,9 @@ def compute_max_precoder_cross_correlation(
         ]
     )
 
-    valid_ranks = (
-        candidate_rank[
-            valid_mask
-        ]
-    )
+    valid_ranks = ranks[
+        valid_mask
+    ]
 
     if torch.any(
         valid_ranks < 1
@@ -248,149 +277,278 @@ def compute_max_precoder_cross_correlation(
         .dtype
     )
 
-    max_correlation = torch.zeros(
-        (
-            num_candidates,
-            allocation.num_rbgs,
-        ),
-        dtype=real_dtype,
+    #
+    # Fast path for the first SDS layer.
+    #
+    # There is nobody already scheduled, therefore
+    # every cross-correlation is exactly zero.
+    #
+    has_scheduled_candidate = torch.any(
+        allocation.candidate_by_user_slot
+        != NO_ALLOCATION
+    )
+
+    if not bool(
+        has_scheduled_candidate.item()
+    ):
+        return torch.zeros(
+            (
+                num_candidates,
+                allocation.num_rbgs,
+            ),
+            dtype=real_dtype,
+            device=device,
+        )
+
+    # ==========================================================
+    # 1. Build active spatial-mode masks.
+    # ==========================================================
+    #
+    # rank=1:
+    #     [True, False]
+    #
+    # rank=2:
+    #     [True, True]
+    #
+    mode_indices = torch.arange(
+        max_available_modes,
+        dtype=torch.long,
         device=device,
     )
 
-    for rbg_index in range(
-        allocation.num_rbgs
-    ):
+    active_mode_mask = (
+        mode_indices.unsqueeze(0)
+        < ranks.unsqueeze(1)
+    )
 
-        scheduled_candidates = (
-            selected_candidates_for_rbg(
-                allocation=allocation,
-                rbg_index=rbg_index,
-            )
+    active_mode_mask = (
+        active_mode_mask
+        & valid_mask.unsqueeze(1)
+    )
+
+    # ==========================================================
+    # 2. Compute ALL pairwise precoder overlaps at once.
+    # ==========================================================
+    #
+    # directions:
+    #
+    #     [candidate, RBG, mode, TX]
+    #
+    # overlap:
+    #
+    #     [RBG,
+    #      candidate_i,
+    #      candidate_j,
+    #      mode_i,
+    #      mode_j]
+    #
+    # overlap[..., i, j, a, b] =
+    #
+    #       v_(i,a)^H v_(j,b)
+    #
+    overlap = torch.einsum(
+        "crmt,drnt->rcdmn",
+        candidate_precoder_directions.conj(),
+        candidate_precoder_directions,
+    )
+
+    absolute_overlap = torch.abs(
+        overlap
+    )
+
+    # ==========================================================
+    # 3. Apply candidate-i rank.
+    # ==========================================================
+    #
+    # The scalar implementation performs:
+    #
+    #     absolute_overlap.sum(dim=0)
+    #
+    # over candidate i's active streams.
+    #
+    candidate_mode_mask = (
+        active_mode_mask[
+            None,
+            :,
+            None,
+            :,
+            None,
+        ]
+    )
+
+    absolute_overlap = (
+        absolute_overlap
+        * candidate_mode_mask
+    )
+
+    #
+    # Sum candidate-i streams.
+    #
+    # Result:
+    #
+    # [RBG, candidate_i, candidate_j, mode_j]
+    #
+    correlation_by_scheduled_stream = (
+        absolute_overlap.sum(
+            dim=-2
         )
+    )
 
-        if (
-            scheduled_candidates.numel()
-            == 0
-        ):
-            continue
+    # ==========================================================
+    # 4. Apply scheduled-candidate rank.
+    # ==========================================================
 
-        for candidate_index in range(
-            num_candidates
-        ):
+    scheduled_mode_mask = (
+        active_mode_mask[
+            None,
+            None,
+            :,
+            :,
+        ]
+    )
 
-            if not bool(
-                valid_mask[
-                    candidate_index
-                ].item()
-            ):
-                continue
+    correlation_by_scheduled_stream = (
+        correlation_by_scheduled_stream
+        * scheduled_mode_mask
+    )
 
-            comparison_candidates = (
-                scheduled_candidates[
-                    scheduled_candidates
-                    != candidate_index
-                ]
-            )
+    #
+    # Original implementation:
+    #
+    # pair_correlation =
+    #     correlation_by_scheduled_stream.max()
+    #
+    # for each candidate pair.
+    #
+    # Result:
+    #
+    # [RBG, candidate_i, candidate_j]
+    #
+    pair_correlation = (
+        correlation_by_scheduled_stream.max(
+            dim=-1
+        ).values
+    )
 
-            if (
-                comparison_candidates.numel()
-                == 0
-            ):
-                continue
+    # ==========================================================
+    # 5. Determine which candidates are already scheduled
+    #    on each RBG.
+    # ==========================================================
+    #
+    # allocation:
+    #
+    #     [user_slot, RBG]
+    #
+    # scheduled_on_rbg:
+    #
+    #     [RBG, candidate]
+    #
+    candidate_indices = torch.arange(
+        num_candidates,
+        dtype=torch.long,
+        device=device,
+    )
 
+    scheduled_on_rbg = (
+        allocation
+        .candidate_by_user_slot
+        .transpose(
+            0,
+            1
+        )
+        .unsqueeze(-1)
+        == candidate_indices[
+            None,
+            None,
+            :,
+        ]
+    )
 
-            candidate_rank_value = int(
-                candidate_rank[
-                    candidate_index
-                ].item()
-            )
+    scheduled_on_rbg = (
+        scheduled_on_rbg.any(
+            dim=1
+        )
+    )
 
-            candidate_directions = (
-                candidate_precoder_directions[
-                    candidate_index,
-                    rbg_index,
-                    :candidate_rank_value,
-                    :,
-                ]
-            )
+    # ==========================================================
+    # 6. Build candidate-pair comparison mask.
+    # ==========================================================
+    #
+    # A candidate i may compare against j iff:
+    #
+    #   i is valid
+    #   j is valid
+    #   j is scheduled on this RBG
+    #   i != j
+    #
+    comparison_mask = (
+        scheduled_on_rbg[
+            :,
+            None,
+            :,
+        ]
+        & valid_mask[
+            None,
+            :,
+            None,
+        ]
+        & valid_mask[
+            None,
+            None,
+            :,
+        ]
+    )
 
-            candidate_precoder = (
-                candidate_directions
-                .transpose(
-                    0,
-                    1,
-                )
-            )
+    not_self = ~torch.eye(
+        num_candidates,
+        dtype=torch.bool,
+        device=device,
+    )
 
-            candidate_max = torch.zeros(
-                (),
-                dtype=real_dtype,
-                device=device,
-            )
+    comparison_mask = (
+        comparison_mask
+        & not_self.unsqueeze(0)
+    )
 
-            for scheduled_index_tensor in (
-                comparison_candidates
-            ):
+    # ==========================================================
+    # 7. Maximum correlation against already scheduled UEs.
+    # ==========================================================
+    #
+    # All correlations are non-negative.
+    # Masked comparisons therefore safely become zero.
+    #
+    masked_pair_correlation = torch.where(
+        comparison_mask,
+        pair_correlation,
+        torch.zeros_like(
+            pair_correlation
+        ),
+    )
 
-                scheduled_index = int(
-                    scheduled_index_tensor.item()
-                )
+    #
+    # Max over scheduled candidate j.
+    #
+    # [RBG, candidate_i]
+    #
+    max_correlation = (
+        masked_pair_correlation.max(
+            dim=-1
+        ).values
+    )
 
-                scheduled_rank = int(
-                    candidate_rank[
-                        scheduled_index
-                    ].item()
-                )
-
-                scheduled_directions = (
-                    candidate_precoder_directions[
-                        scheduled_index,
-                        rbg_index,
-                        :scheduled_rank,
-                        :,
-                    ]
-                )
-
-                scheduled_precoder = (
-                    scheduled_directions
-                    .transpose(
-                        0,
-                        1,
-                    )
-                )
-
-                overlap = (
-                    candidate_precoder
-                    .conj()
-                    .transpose(
-                        0,
-                        1,
-                    )
-                    @ scheduled_precoder
-                )
-
-                absolute_overlap = torch.abs(
-                    overlap
-                )
-
-                correlation_by_scheduled_stream = (
-                    absolute_overlap.sum(
-                        dim=0
-                    )
-                )
-
-                pair_correlation = (
-                    correlation_by_scheduled_stream.max()
-                )
-                candidate_max = torch.maximum(
-                    candidate_max,
-                    pair_correlation,
-                )
-
-            max_correlation[
-                candidate_index,
-                rbg_index,
-            ] = candidate_max
+    #
+    # Public API:
+    #
+    # [candidate, RBG]
+    #
+    max_correlation = (
+        max_correlation
+        .transpose(
+            0,
+            1
+        )
+        .contiguous()
+    )
 
     return max_correlation
 
