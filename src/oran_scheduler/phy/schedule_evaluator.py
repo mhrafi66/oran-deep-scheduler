@@ -278,7 +278,159 @@ def _validate_selected_physical_ues(
             "the stored PHY UE dimension."
         )
 
+def _select_precomputed_candidate_phy(
+    *,
+    selected_candidate_indices: torch.Tensor,
+    num_candidates: int,
+    h_freq: torch.Tensor,
+    first_subcarrier: int,
+    last_subcarrier: int,
+    precomputed_candidate_serving_channel: (
+        torch.Tensor | None
+    ),
+    precomputed_candidate_inter_cell_covariance: (
+        torch.Tensor | None
+    ),
+) -> (
+    tuple[
+        torch.Tensor,
+        torch.Tensor,
+    ]
+    | None
+):
+    """
+    Select precomputed PHY tensors for one hypothetical
+    candidate set.
 
+    OPEN-REPRODUCTION ENGINEERING OPTIMIZATION.
+
+    This does not approximate or alter the PHY.
+    It only reuses quantities invariant to the
+    hypothetical same-cell candidate combination.
+    """
+
+    has_serving = (
+        precomputed_candidate_serving_channel
+        is not None
+    )
+
+    has_covariance = (
+        precomputed_candidate_inter_cell_covariance
+        is not None
+    )
+
+    if has_serving != has_covariance:
+        raise ValueError(
+            "Precomputed serving channel and "
+            "inter-cell covariance must either both "
+            "be provided or both be None."
+        )
+
+    if not has_serving:
+        return None
+
+    assert (
+        precomputed_candidate_serving_channel
+        is not None
+    )
+
+    assert (
+        precomputed_candidate_inter_cell_covariance
+        is not None
+    )
+
+    device = h_freq.device
+
+    if (
+        precomputed_candidate_serving_channel.device
+        != device
+    ):
+        raise ValueError(
+            "Precomputed serving channel is on the "
+            "wrong device."
+        )
+
+    if (
+        precomputed_candidate_inter_cell_covariance.device
+        != device
+    ):
+        raise ValueError(
+            "Precomputed interference covariance is "
+            "on the wrong device."
+        )
+
+    num_symbols = int(
+        h_freq.shape[5]
+    )
+
+    num_subcarriers = int(
+        h_freq.shape[6]
+    )
+
+    num_rx = int(
+        h_freq.shape[2]
+    )
+
+    num_tx = int(
+        h_freq.shape[4]
+    )
+
+    expected_serving_shape = (
+        num_candidates,
+        num_symbols,
+        num_subcarriers,
+        num_rx,
+        num_tx,
+    )
+
+    expected_covariance_shape = (
+        num_candidates,
+        num_symbols,
+        num_subcarriers,
+        num_rx,
+        num_rx,
+    )
+
+    if tuple(
+        precomputed_candidate_serving_channel.shape
+    ) != expected_serving_shape:
+        raise ValueError(
+            "Unexpected precomputed serving-channel "
+            "shape."
+        )
+
+    if tuple(
+        precomputed_candidate_inter_cell_covariance.shape
+    ) != expected_covariance_shape:
+        raise ValueError(
+            "Unexpected precomputed interference-"
+            "covariance shape."
+        )
+
+    selected_serving_channel = (
+        precomputed_candidate_serving_channel[
+            selected_candidate_indices,
+            :,
+            first_subcarrier:last_subcarrier,
+            :,
+            :,
+        ]
+    )
+
+    selected_inter_cell_covariance = (
+        precomputed_candidate_inter_cell_covariance[
+            selected_candidate_indices,
+            :,
+            first_subcarrier:last_subcarrier,
+            :,
+            :,
+        ]
+    )
+
+    return (
+        selected_serving_channel,
+        selected_inter_cell_covariance,
+    )
 
 def evaluate_rbg_candidate_set(
     selected_candidate_indices: torch.Tensor,
@@ -296,6 +448,14 @@ def evaluate_rbg_candidate_set(
     rate_config: RateConfig,
     batch_index: int = 0,
     candidate_physical_ue_indices: (
+        torch.Tensor | None
+    ) = None,
+
+    precomputed_candidate_serving_channel: (
+        torch.Tensor | None
+    ) = None,
+
+    precomputed_candidate_inter_cell_covariance: (
         torch.Tensor | None
     ) = None,
 ) -> RBGAllocationEvaluationData:
@@ -511,57 +671,86 @@ def evaluate_rbg_candidate_set(
         + subcarriers_per_rbg
     )
 
-    selected_all_bs_channel = (
-        h_freq[
-            batch_index,
-            selected_physical_ues,
-            :,
-            :,
-            :,
-            :,
-            first_subcarrier:last_subcarrier,
-        ]
-    )
-
-    selected_all_bs_channel = (
-        selected_all_bs_channel
-        .permute(
-            0,
-            4,
-            5,
-            2,
-            1,
-            3,
-        )
-        .contiguous()
-    )
-
-
-    inter_cell_covariance = (
-        compute_isotropic_inter_cell_covariance(
-            all_bs_channel=(
-                selected_all_bs_channel
+    precomputed_phy = (
+        _select_precomputed_candidate_phy(
+            selected_candidate_indices=(
+                selected_candidate_indices
             ),
-            serving_cell_index=(
-                serving_cell_index
+            num_candidates=num_candidates,
+            h_freq=h_freq,
+            first_subcarrier=(
+                first_subcarrier
             ),
-            tx_power_per_subcarrier_w=(
-                tx_power_per_subcarrier_w
+            last_subcarrier=(
+                last_subcarrier
+            ),
+            precomputed_candidate_serving_channel=(
+                precomputed_candidate_serving_channel
+            ),
+            precomputed_candidate_inter_cell_covariance=(
+                precomputed_candidate_inter_cell_covariance
             ),
         )
     )
 
+    if precomputed_phy is not None:
 
-    selected_serving_channel = (
-        selected_all_bs_channel[
-            :,
-            :,
-            :,
-            serving_cell_index,
-            :,
-            :,
-        ]
-    )
+        (
+            selected_serving_channel,
+            inter_cell_covariance,
+        ) = precomputed_phy
+
+    else:
+
+        selected_all_bs_channel = (
+            h_freq[
+                batch_index,
+                selected_physical_ues,
+                :,
+                :,
+                :,
+                :,
+                first_subcarrier:last_subcarrier,
+            ]
+        )
+
+        selected_all_bs_channel = (
+            selected_all_bs_channel
+            .permute(
+                0,
+                4,
+                5,
+                2,
+                1,
+                3,
+            )
+            .contiguous()
+        )
+
+        inter_cell_covariance = (
+            compute_isotropic_inter_cell_covariance(
+                all_bs_channel=(
+                    selected_all_bs_channel
+                ),
+                serving_cell_index=(
+                    serving_cell_index
+                ),
+                tx_power_per_subcarrier_w=(
+                    tx_power_per_subcarrier_w
+                ),
+            )
+        )
+
+        selected_serving_channel = (
+            selected_all_bs_channel[
+                :,
+                :,
+                :,
+                serving_cell_index,
+                :,
+                :,
+            ]
+        )
 
 
     rzf_alpha = estimate_rzf_alpha(
@@ -878,6 +1067,14 @@ def evaluate_cell_allocation(
     candidate_physical_ue_indices: (
         torch.Tensor | None
     ) = None,
+
+    precomputed_candidate_serving_channel: (
+        torch.Tensor | None
+    ) = None,
+
+    precomputed_candidate_inter_cell_covariance: (
+        torch.Tensor | None
+    ) = None,
 ) -> CellAllocationEvaluationData:
     """
     Physically evaluate every RBG of one cell allocation.
@@ -1129,57 +1326,86 @@ def evaluate_cell_allocation(
             + subcarriers_per_rbg
         )
 
-        selected_all_bs_channel = (
-            h_freq[
-                batch_index,
-                selected_physical_ues,
-                :,
-                :,
-                :,
-                :,
-                first_subcarrier:last_subcarrier,
-            ]
-        )
-
-
-        selected_all_bs_channel = (
-            selected_all_bs_channel
-            .permute(
-                0,
-                4,
-                5,
-                2,
-                1,
-                3,
-            )
-            .contiguous()
-        )
-
-        inter_cell_covariance = (
-            compute_isotropic_inter_cell_covariance(
-                all_bs_channel=(
-                    selected_all_bs_channel
+        precomputed_phy = (
+            _select_precomputed_candidate_phy(
+                selected_candidate_indices=(
+                    selected_candidate_indices
                 ),
-                serving_cell_index=(
-                    serving_cell_index
+                num_candidates=num_candidates,
+                h_freq=h_freq,
+                first_subcarrier=(
+                    first_subcarrier
                 ),
-                tx_power_per_subcarrier_w=(
-                    tx_power_per_subcarrier_w
+                last_subcarrier=(
+                    last_subcarrier
+                ),
+                precomputed_candidate_serving_channel=(
+                    precomputed_candidate_serving_channel
+                ),
+                precomputed_candidate_inter_cell_covariance=(
+                    precomputed_candidate_inter_cell_covariance
                 ),
             )
         )
 
+        if precomputed_phy is not None:
 
-        selected_serving_channel = (
-            selected_all_bs_channel[
-                :,
-                :,
-                :,
-                serving_cell_index,
-                :,
-                :,
-            ]
-        )
+            (
+                selected_serving_channel,
+                inter_cell_covariance,
+            ) = precomputed_phy
+
+        else:
+
+            selected_all_bs_channel = (
+                h_freq[
+                    batch_index,
+                    selected_physical_ues,
+                    :,
+                    :,
+                    :,
+                    :,
+                    first_subcarrier:last_subcarrier,
+                ]
+            )
+
+            selected_all_bs_channel = (
+                selected_all_bs_channel
+                .permute(
+                    0,
+                    4,
+                    5,
+                    2,
+                    1,
+                    3,
+                )
+                .contiguous()
+            )
+
+            inter_cell_covariance = (
+                compute_isotropic_inter_cell_covariance(
+                    all_bs_channel=(
+                        selected_all_bs_channel
+                    ),
+                    serving_cell_index=(
+                        serving_cell_index
+                    ),
+                    tx_power_per_subcarrier_w=(
+                        tx_power_per_subcarrier_w
+                    ),
+                )
+            )
+
+            selected_serving_channel = (
+                selected_all_bs_channel[
+                    :,
+                    :,
+                    :,
+                    serving_cell_index,
+                    :,
+                    :,
+                ]
+            )
 
 
         rzf_alpha = estimate_rzf_alpha(

@@ -242,6 +242,115 @@ class OneLDSCellTTIStateManager:
         ) = None
 
 
+    def reset_average_throughput_bps(
+        self,
+        value_bps: float | torch.Tensor,
+    ) -> None:
+        """
+        Reset persistent PF throughput history.
+
+        Intended for controlled restart / state-loss
+        experiments.
+
+        The serving-UE layout and temporal TTI index are
+        preserved.
+
+        A reset is legal only between TTIs.
+        """
+
+        if self._active_tti is not None:
+            raise RuntimeError(
+                "Cannot reset PF history while a TTI "
+                "is active."
+            )
+
+        if isinstance(
+            value_bps,
+            torch.Tensor,
+        ):
+            if tuple(
+                value_bps.shape
+            ) != tuple(
+                self._average_throughput_bps.shape
+            ):
+                raise ValueError(
+                    "PF reset tensor must have shape "
+                    "[serving_ue]."
+                )
+
+            if (
+                value_bps.device
+                != self._average_throughput_bps.device
+            ):
+                raise ValueError(
+                    "PF reset tensor is on the wrong "
+                    "device."
+                )
+
+            reset_value = (
+                value_bps
+                .to(
+                    dtype=(
+                        self
+                        ._average_throughput_bps
+                        .dtype
+                    )
+                )
+                .detach()
+                .clone()
+            )
+
+        else:
+            reset_scalar = float(
+                value_bps
+            )
+
+            if (
+                not torch.isfinite(
+                    torch.tensor(
+                        reset_scalar
+                    )
+                )
+                or reset_scalar < 0.0
+            ):
+                raise ValueError(
+                    "PF reset value must be finite "
+                    "and non-negative."
+                )
+
+            reset_value = torch.full_like(
+                self._average_throughput_bps,
+                fill_value=reset_scalar,
+            )
+
+        if not torch.isfinite(
+            reset_value
+        ).all():
+            raise ValueError(
+                "PF reset history contains "
+                "non-finite values."
+            )
+
+        if torch.any(
+            reset_value < 0.0
+        ):
+            raise ValueError(
+                "PF reset history cannot be negative."
+            )
+
+        #
+        # Invalid padded serving slots should not carry
+        # artificial PF history.
+        #
+        self._average_throughput_bps = torch.where(
+            self._serving_ue_valid_mask,
+            reset_value,
+            torch.zeros_like(
+                reset_value
+            ),
+        )
+
+
     @property
     def current_average_throughput_bps(
         self,

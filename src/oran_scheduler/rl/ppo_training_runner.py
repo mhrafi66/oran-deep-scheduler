@@ -73,6 +73,25 @@ class PPOTrainingTTIInputs:
         torch.Tensor | None
     ) = None
 
+    #
+    # Optional per-TTI scheduling gate.
+    #
+    # This is intentionally separate from
+    # observation.serving_ue_valid_mask:
+    #
+    #     serving_ue_valid_mask
+    #         = static association / padded layout
+    #
+    #     tds_eligibility_override_mask
+    #         = temporary schedulability
+    #
+    # The override may only REMOVE UEs from the
+    # normal PF-TDS eligible population.
+    #
+    tds_eligibility_override_mask: (
+        torch.Tensor | None
+    ) = None
+
 
 PPOTrainingTTIInputProvider = Callable[
     [
@@ -350,6 +369,12 @@ def run_single_cell_ppo_training(
             packet_arrivals=(
                 tti_inputs.packet_arrivals
             ),
+
+            tds_eligibility_override_mask=(
+                tti_inputs
+                .tds_eligibility_override_mask
+            ),
+
             device=device,
         )
 

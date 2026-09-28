@@ -583,6 +583,23 @@ def evaluate_ppo_physical_tti(
                 physical_inputs
                 .batch_index
             ),
+            precomputed_candidate_serving_channel=(
+                None
+                if physical_scorer is None
+                else (
+                    physical_scorer
+                    .precomputed_candidate_serving_channel
+                )
+            ),
+
+            precomputed_candidate_inter_cell_covariance=(
+                None
+                if physical_scorer is None
+                else (
+                    physical_scorer
+                    .precomputed_candidate_inter_cell_covariance
+                )
+            ),
         )
     )
 

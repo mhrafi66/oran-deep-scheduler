@@ -34,7 +34,9 @@ from oran_scheduler.rl.ppo_training_runner import (
     PPOTrainingTTIInputs,
 )
 from oran_scheduler.rl.ppo_traffic_cell_step import (
+    PPOExecutionScheduleTransform,
     PPOTrafficRewardPopulation,
+    PreparedTrafficAwarePPOCellTTI,
     TrafficAwarePPOCellTTIStepResult,
     prepare_traffic_aware_ppo_cell_tti,
     run_traffic_aware_ppo_cell_tti_step,
@@ -55,6 +57,10 @@ from oran_scheduler.state.one_lds import (
     OneLDSStateConfig,
 )
 
+from oran_scheduler.utils.perf_timing import (
+    perf_region,
+)
+
 
 PPOMultiCellTrainingTTIInputProvider = Callable[
     [
@@ -69,6 +75,16 @@ PPOMultiCellResultObserver = Callable[
         int,
         int,
         TrafficAwarePPOCellTTIStepResult,
+    ],
+    None,
+]
+
+
+PPOMultiCellPreparationObserver = Callable[
+    [
+        int,
+        int,
+        PreparedTrafficAwarePPOCellTTI,
     ],
     None,
 ]
@@ -161,9 +177,21 @@ def run_multicell_ppo_training(
     reward_reduction: (
         PPORewardReduction
     ) = "mean",
+    preparation_observer: (
+        PPOMultiCellPreparationObserver | None
+    ) = None,
     cell_result_observer: (
         PPOMultiCellResultObserver | None
     ) = None,
+
+    execution_schedule_transforms: (
+        tuple[
+            PPOExecutionScheduleTransform | None,
+            ...
+        ]
+        | None
+    ) = None,
+
     device: str | torch.device = "cuda:0",
 ) -> PPOMultiCellTrainingRunResult:
     """
@@ -221,6 +249,19 @@ def run_multicell_ppo_training(
         raise ValueError(
             "rollout_controllers must contain one "
             "entry per centralized stream."
+        )
+
+
+    if (
+        execution_schedule_transforms
+        is not None
+        and len(
+            execution_schedule_transforms
+        ) != num_cells
+    ):
+        raise ValueError(
+            "execution_schedule_transforms must "
+            "contain one entry per cell."
         )
 
     shared_transition_buffer = (
@@ -370,10 +411,14 @@ def run_multicell_ppo_training(
         for cell_index in range(
             num_cells
         ):
-            tti_inputs = input_provider(
-                tti_index,
-                cell_index,
-            )
+            with perf_region(
+                "runner.input_provider",
+                device=device,
+            ):
+                tti_inputs = input_provider(
+                    tti_index,
+                    cell_index,
+                )
 
             controller = (
                 rollout_controllers[
@@ -381,43 +426,60 @@ def run_multicell_ppo_training(
                 ]
             )
 
-            preparation = (
-                prepare_traffic_aware_ppo_cell_tti(
-                    tti_index=tti_index,
-                    observation=(
-                        tti_inputs
-                        .observation
-                    ),
-                    traffic_manager=(
-                        traffic_managers[
-                            cell_index
-                        ]
-                    ),
-                    tds_eligibility_config=(
-                        tds_eligibility_config
-                    ),
-                    state_manager=(
-                        state_managers[
-                            cell_index
-                        ]
-                    ),
-                    state_config=state_config,
-                    physical_inputs_builder=(
-                        tti_inputs
-                        .physical_inputs_builder
-                    ),
-                    num_user_slots=(
-                        controller
-                        .config
-                        .num_user_slots
-                    ),
-                    packet_arrivals=(
-                        tti_inputs
-                        .packet_arrivals
-                    ),
-                    device=device,
+            with perf_region(
+                "runner.prepare_cell",
+                device=device,
+            ):
+                preparation = (
+                    prepare_traffic_aware_ppo_cell_tti(
+                        tti_index=tti_index,
+                        observation=(
+                            tti_inputs
+                            .observation
+                        ),
+                        traffic_manager=(
+                            traffic_managers[
+                                cell_index
+                            ]
+                        ),
+                        tds_eligibility_config=(
+                            tds_eligibility_config
+                        ),
+                        state_manager=(
+                            state_managers[
+                                cell_index
+                            ]
+                        ),
+                        state_config=state_config,
+                        physical_inputs_builder=(
+                            tti_inputs
+                            .physical_inputs_builder
+                        ),
+                        num_user_slots=(
+                            controller
+                            .config
+                            .num_user_slots
+                        ),
+                        packet_arrivals=(
+                            tti_inputs
+                            .packet_arrivals
+                        ),
+
+                        tds_eligibility_override_mask=(
+                            tti_inputs
+                            .tds_eligibility_override_mask
+                        ),
+
+                        device=device,
+                    )
                 )
-            )
+
+            if preparation_observer is not None:
+                preparation_observer(
+                    tti_index,
+                    cell_index,
+                    preparation,
+                )
 
             preparations.append(
                 (
@@ -462,11 +524,21 @@ def run_multicell_ppo_training(
             # It is finally safe to update the shared
             # policy.
             #
-            centralized_training.update_if_ready(
-                actor=actor,
-                critic=critic,
-                optimizers=optimizers,
-            )
+            # centralized_training.update_if_ready(
+            #     actor=actor,
+            #     critic=critic,
+            #     optimizers=optimizers,
+            # )
+
+            with perf_region(
+                "runner.central_update",
+                device=device,
+            ):
+                centralized_training.update_if_ready(
+                    actor=actor,
+                    critic=critic,
+                    optimizers=optimizers,
+                )
 
         #
         # ------------------------------------------------------
@@ -486,69 +558,86 @@ def run_multicell_ppo_training(
                 cell_index
             ]
 
-            cell_result = (
-                run_traffic_aware_ppo_cell_tti_step(
-                    tti_index=tti_index,
-                    collect_experience=(
-                        collect_experience
-                    ),
-                    observation=(
-                        tti_inputs
-                        .observation
-                    ),
-                    traffic_manager=(
-                        traffic_managers[
-                            cell_index
-                        ]
-                    ),
-                    tds_eligibility_config=(
-                        tds_eligibility_config
-                    ),
-                    state_manager=(
-                        state_managers[
-                            cell_index
-                        ]
-                    ),
-                    training_controller=(
-                        rollout_controllers[
-                            cell_index
-                        ]
-                    ),
-                    state_config=state_config,
-                    physical_inputs_builder=(
-                        tti_inputs
-                        .physical_inputs_builder
-                    ),
-                    greedy_config=greedy_config,
-                    reward_config=reward_config,
-                    reward_population=(
-                        reward_population
-                    ),
-                    expert_buffer=(
-                        expert_buffer
-                    ),
-                    pf_expert_config=(
-                        pf_expert_config
-                    ),
-                    candidate_augmentation_config=(
-                        expert_candidate_augmentation_config
-                    ),
-                    candidate_augmentation_generator=(
-                        expert_candidate_augmentation_generator
-                    ),
-                    preparation=(
-                        preparation
-                    ),
-                    reward_reduction=(
-                        reward_reduction
-                    ),
-                    packet_arrivals=(
-                        tti_inputs
-                        .packet_arrivals
-                    ),
-                    device=device,
+            with perf_region(
+                "runner.cell_step",
+                device=device,
+            ):
+                cell_result = (
+                    run_traffic_aware_ppo_cell_tti_step(
+                        tti_index=tti_index,
+                        collect_experience=(
+                            collect_experience
+                        ),
+                        observation=(
+                            tti_inputs
+                            .observation
+                        ),
+                        traffic_manager=(
+                            traffic_managers[
+                                cell_index
+                            ]
+                        ),
+                        tds_eligibility_config=(
+                            tds_eligibility_config
+                        ),
+                        state_manager=(
+                            state_managers[
+                                cell_index
+                            ]
+                        ),
+                        training_controller=(
+                            rollout_controllers[
+                                cell_index
+                            ]
+                        ),
+                        state_config=state_config,
+                        physical_inputs_builder=(
+                            tti_inputs
+                            .physical_inputs_builder
+                        ),
+                        greedy_config=greedy_config,
+                        reward_config=reward_config,
+                        reward_population=(
+                            reward_population
+                        ),
+                        expert_buffer=(
+                            expert_buffer
+                        ),
+                        pf_expert_config=(
+                            pf_expert_config
+                        ),
+                        candidate_augmentation_config=(
+                            expert_candidate_augmentation_config
+                        ),
+                        candidate_augmentation_generator=(
+                            expert_candidate_augmentation_generator
+                        ),
+                        preparation=(
+                            preparation
+                        ),
+                        execution_schedule_transform=(
+                            None
+                            if (
+                                execution_schedule_transforms
+                                is None
+                            )
+                            else (
+                                execution_schedule_transforms[
+                                    cell_index
+                                ]
+                            )
+                        ),
+
+                        reward_reduction=(
+                            reward_reduction
+                        ),
+                        packet_arrivals=(
+                            tti_inputs
+                            .packet_arrivals
+                        ),
+                        device=device,
+                    )
                 )
-            )
 
             num_expert_demonstrations_added += (
                 cell_result

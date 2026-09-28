@@ -1,12 +1,12 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
 
 from oran_scheduler.phy.csi import (
     compute_ideal_svd_csi,
-    extract_serving_mimo_rbg_channel,
 )
 from oran_scheduler.phy.link_adaptation import (
     LinkAdaptationConfig,
@@ -39,12 +39,20 @@ from oran_scheduler.simulator.cell_association import (
 )
 from oran_scheduler.simulator.channel import (
     ChannelConfig,
+    FrequencyChannelRuntime,
     generate_frequency_channel,
 )
 from oran_scheduler.simulator.one_lds_cell_tti import (
     OneLDSCellTTIObservation,
     OneLDSCellTTIStateManager,
     PreparedOneLDSCellTTI,
+)
+from oran_scheduler.simulator.mobility import (
+    MobilityConfig,
+    build_mobility_snapshot,
+)
+from oran_scheduler.simulator.temporal_channel import (
+    VelocityWindowFrequencyChannelRuntime,
 )
 from oran_scheduler.simulator.topology import (
     TopologyConfig,
@@ -58,6 +66,9 @@ from oran_scheduler.schedulers.pf_tds import (
 from oran_scheduler.state.cqi_features import (
     CQISurrogateConfig,
     build_cqi_surrogate,
+)
+from oran_scheduler.utils.perf_timing import (
+    perf_region,
 )
 
 
@@ -116,6 +127,23 @@ class ChunkedSionnaPPOConfig:
     #
     ue_microbatch_size: int = 2
 
+    #
+    # WAVE-6 DYNAMIC ASSOCIATION.
+    #
+    # False:
+    #     preserve the existing cell/microbatch RNG
+    #     behavior exactly.
+    #
+    # True:
+    #     require ue_microbatch_size == 1 and key
+    #     radio RNG by persistent GLOBAL UE identity.
+    #
+    # This prevents handover from changing a UE's
+    # random channel process merely because its
+    # serving cell or local slot changed.
+    #
+    identity_stable_ue_channel_rng: bool = False
+
     topology_seed: int = 42
 
     association_channel_seed: int = 1000
@@ -139,6 +167,28 @@ class ChunkedSionnaPPOConfig:
     ut_height_m: float = 1.5
 
     ut_speed_kmh: float = 3.0
+
+    # ----------------------------------------------------------
+    # WAVE-4 TEMPORAL RADIO
+    #
+    # independent:
+    #     exact previous behavior
+    #
+    # velocity_window:
+    #     one velocity-driven Sionna temporal
+    #     realization is addressed in windows.
+    #
+    # OPEN-REPRODUCTION:
+    #     simulator scheduling-step duration.
+    # ----------------------------------------------------------
+
+    temporal_radio_mode: str = "independent"
+
+    temporal_window_ttis: int = 8
+
+    tti_duration_s: float = 0.001
+
+    temporal_max_displacement_m: float = 20.0
 
 
     def __post_init__(
@@ -173,6 +223,15 @@ class ChunkedSionnaPPOConfig:
                 "ue_microbatch_size must be positive."
             )
 
+        if (
+            self.identity_stable_ue_channel_rng
+            and self.ue_microbatch_size != 1
+        ):
+            raise ValueError(
+                "identity-stable UE channel RNG "
+                "requires ue_microbatch_size=1."
+            )
+
 
         if not self.scenario:
             raise ValueError(
@@ -197,6 +256,37 @@ class ChunkedSionnaPPOConfig:
         if self.ut_speed_kmh < 0.0:
             raise ValueError(
                 "ut_speed_kmh cannot be negative."
+            )
+
+
+        if self.temporal_radio_mode not in {
+            "independent",
+            "velocity_window",
+        }:
+            raise ValueError(
+                "temporal_radio_mode must be "
+                "'independent' or "
+                "'velocity_window'."
+            )
+
+        if self.temporal_window_ttis <= 0:
+            raise ValueError(
+                "temporal_window_ttis must be "
+                "positive."
+            )
+
+        if self.tti_duration_s <= 0.0:
+            raise ValueError(
+                "tti_duration_s must be positive."
+            )
+
+        if (
+            self.temporal_max_displacement_m
+            <= 0.0
+        ):
+            raise ValueError(
+                "temporal_max_displacement_m "
+                "must be positive."
             )
 
 
@@ -242,6 +332,30 @@ class ChunkedSionnaPPOContext:
     link_adaptation_config: LinkAdaptationConfig
 
     rate_config: RateConfig
+
+    #
+    # PERFORMANCE ENGINEERING.
+    #
+    # One persistent paper-array Sionna runtime is
+    # shared by every serving cell / UE microbatch.
+    #
+    # This changes object lifetime only. The channel
+    # topology and deterministic per-microbatch seed
+    # are still supplied for every generation.
+    #
+    channel_runtime: FrequencyChannelRuntime
+
+    #
+    # None in legacy independent mode.
+    #
+    # In Wave-4 temporal mode this runtime directly
+    # generates multi-TTI velocity-driven Sionna
+    # channel windows.
+    #
+    temporal_channel_runtime: (
+        VelocityWindowFrequencyChannelRuntime
+        | None
+    ) = None
 
 
     @property
@@ -328,15 +442,15 @@ def build_chunked_sionna_ppo_context(
             config.num_ut_per_sector
         ),
 
-        scenario="uma",
+        scenario=config.scenario,
 
-        isd_m=200.0,
+        isd_m=config.isd_m,
 
-        bs_height_m=25.0,
+        bs_height_m=config.bs_height_m,
 
-        ut_height_m=1.5,
+        ut_height_m=config.ut_height_m,
 
-        ut_speed_kmh=3.0,
+        ut_speed_kmh=config.ut_speed_kmh,
 
         seed=config.topology_seed,
 
@@ -569,6 +683,79 @@ def build_chunked_sionna_ppo_context(
         device=config.device,
     )
 
+    # ==========================================================
+    # PERSISTENT PAPER-MIMO SIONNA RUNTIME
+    # ==========================================================
+    #
+    # Previously every UE microbatch recreated:
+    #
+    #     PanelArray
+    #     ResourceGrid
+    #     UMa
+    #     GenerateOFDMChannel
+    #
+    # The runtime now creates those objects once.
+    #
+    # Per-microbatch topology and seed are still
+    # supplied independently below.
+    #
+
+    paper_channel_config = ChannelConfig(
+        carrier_frequency_hz=4.0e9,
+
+        subcarrier_spacing_hz=30.0e3,
+
+        num_rbs=(
+            config.num_rbs
+        ),
+
+        subcarriers_per_rb=(
+            config.subcarriers_per_rb
+        ),
+
+        num_ofdm_symbols=1,
+
+        antenna_mode="paper",
+
+        direction="downlink",
+
+        o2i_model="low",
+
+        enable_pathloss=True,
+
+        enable_shadow_fading=True,
+
+        precision="single",
+
+        device=config.device,
+
+        #
+        # The actual realization seed is supplied
+        # separately to runtime.generate().
+        #
+        seed=config.mimo_channel_seed,
+    )
+
+    channel_runtime = (
+        FrequencyChannelRuntime(
+            config=(
+                paper_channel_config
+            )
+        )
+    )
+
+    temporal_channel_runtime = None
+
+    if (
+        config.temporal_radio_mode
+        == "velocity_window"
+    ):
+        temporal_channel_runtime = (
+            VelocityWindowFrequencyChannelRuntime(
+                config=paper_channel_config
+            )
+        )
+
     return ChunkedSionnaPPOContext(
         config=config,
 
@@ -601,6 +788,546 @@ def build_chunked_sionna_ppo_context(
         ),
 
         rate_config=rate_config,
+
+        channel_runtime=(
+            channel_runtime
+        ),
+
+        temporal_channel_runtime=(
+            temporal_channel_runtime
+        ),
+    )
+
+
+
+def _temporal_window_coordinates(
+    *,
+    tti_index: int,
+    window_ttis: int,
+) -> tuple[
+    int,
+    int,
+    int,
+]:
+    """
+    Map absolute TTI ->
+
+        window index,
+        window start TTI,
+        offset inside window.
+
+    Example, W=8:
+
+        t=0  -> (0, 0, 0)
+        t=7  -> (0, 0, 7)
+        t=8  -> (1, 8, 0)
+        t=11 -> (1, 8, 3)
+    """
+
+    if tti_index < 0:
+        raise ValueError(
+            "tti_index must be non-negative."
+        )
+
+    if window_ttis <= 0:
+        raise ValueError(
+            "window_ttis must be positive."
+        )
+
+    window_index = (
+        tti_index
+        // window_ttis
+    )
+
+    window_start_tti = (
+        window_index
+        * window_ttis
+    )
+
+    offset = (
+        tti_index
+        - window_start_tti
+    )
+
+    return (
+        window_index,
+        window_start_tti,
+        offset,
+    )
+
+
+def _temporal_microbatch_channel_seed(
+    *,
+    context: ChunkedSionnaPPOContext,
+    window_index: int,
+    real_cell_index: int,
+    microbatch_index: int,
+) -> int:
+    """
+    Deterministic seed shared by every TTI inside
+    one temporal radio window.
+
+    This is the critical difference from the old
+    independent realization path.
+
+    Old:
+        seed depends on TTI.
+
+    New:
+        seed depends on temporal WINDOW.
+
+    Therefore offsets 0..W-1 address time samples
+    from the same Sionna realization.
+    """
+
+    if window_index < 0:
+        raise ValueError(
+            "window_index must be non-negative."
+        )
+
+    if not (
+        0
+        <= real_cell_index
+        < context.num_cells
+    ):
+        raise ValueError(
+            "real_cell_index outside topology."
+        )
+
+    if microbatch_index < 0:
+        raise ValueError(
+            "microbatch_index must be non-negative."
+        )
+
+    seed_stride = (
+        context.num_global_ues
+        + 1
+    )
+
+    window_cell_ordinal = (
+        window_index
+        * context.num_cells
+        + real_cell_index
+    )
+
+    return int(
+        context.config.mimo_channel_seed
+        + window_cell_ordinal
+        * seed_stride
+        + microbatch_index
+    )
+
+
+
+
+def _identity_stable_independent_ue_seed(
+    *,
+    context: ChunkedSionnaPPOContext,
+    tti_index: int,
+    global_ue_index: int,
+) -> int:
+    """
+    Independent-radio seed owned by GLOBAL UE identity.
+
+    Association/local scheduler position does not
+    enter this seed.
+    """
+
+    if tti_index < 0:
+        raise ValueError(
+            "tti_index must be non-negative."
+        )
+
+    if not (
+        0
+        <= global_ue_index
+        < context.num_global_ues
+    ):
+        raise ValueError(
+            "global_ue_index outside topology."
+        )
+
+    seed_stride = (
+        context.num_global_ues
+        + 1
+    )
+
+    return int(
+        context
+        .config
+        .mimo_channel_seed
+
+        + tti_index
+        * seed_stride
+
+        + global_ue_index
+    )
+
+
+def _identity_stable_temporal_ue_seed(
+    *,
+    context: ChunkedSionnaPPOContext,
+    window_index: int,
+    global_ue_index: int,
+) -> int:
+    """
+    Temporal-window seed owned by GLOBAL UE identity.
+
+    Every TTI within one temporal window addresses
+    the same underlying Sionna realization.
+
+    A handover does not change this seed.
+    """
+
+    if window_index < 0:
+        raise ValueError(
+            "window_index must be non-negative."
+        )
+
+    if not (
+        0
+        <= global_ue_index
+        < context.num_global_ues
+    ):
+        raise ValueError(
+            "global_ue_index outside topology."
+        )
+
+    seed_stride = (
+        context.num_global_ues
+        + 1
+    )
+
+    return int(
+        context
+        .config
+        .mimo_channel_seed
+
+        + window_index
+        * seed_stride
+
+        + global_ue_index
+    )
+
+
+def _generate_microbatch_h_freq(
+    *,
+    context: ChunkedSionnaPPOContext,
+    tti_index: int,
+    real_cell_index: int,
+    microbatch_index: int,
+    microbatch_global_ue_indices: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Generate exactly one TTI-shaped paper-MIMO H.
+
+    Returned shape is identical in BOTH modes:
+
+        [
+            batch,
+            microbatch UE,
+            RX,
+            all 21 BS,
+            TX,
+            1 time sample,
+            subcarrier,
+        ]
+
+    Modes
+    -----
+
+    independent:
+        Preserve the original implementation exactly.
+
+    velocity_window:
+        1. Find this TTI's temporal window.
+        2. Move UE geometry to the START of the window.
+        3. Generate W velocity-driven Sionna samples.
+        4. Return only the current TTI offset.
+
+    MEMORY POLICY
+    -------------
+    Production generates W correlated CIR samples,
+    selects the requested CIR time sample, and only
+    then performs OFDM/subcarrier expansion.
+
+    The complete W-sample paper-MIMO frequency tensor
+    is never materialized in this path.
+    """
+
+    mode = (
+        context
+        .config
+        .temporal_radio_mode
+    )
+
+    identity_stable = bool(
+        getattr(
+            context.config,
+            "identity_stable_ue_channel_rng",
+            False,
+        )
+    )
+
+    identity_global_ue = None
+
+    if identity_stable:
+
+        if int(
+            microbatch_global_ue_indices
+            .numel()
+        ) != 1:
+            raise ValueError(
+                "Identity-stable radio generation "
+                "requires exactly one UE per "
+                "microbatch."
+            )
+
+        identity_global_ue = int(
+            microbatch_global_ue_indices[
+                0
+            ].item()
+        )
+
+    if mode == "independent":
+
+        microbatch_topology = (
+            subset_topology_ues(
+                topology=context.topology,
+
+                global_ue_indices=(
+                    microbatch_global_ue_indices
+                ),
+            )
+        )
+
+        if identity_stable:
+
+            assert (
+                identity_global_ue
+                is not None
+            )
+
+            channel_seed = (
+                _identity_stable_independent_ue_seed(
+                    context=context,
+
+                    tti_index=tti_index,
+
+                    global_ue_index=(
+                        identity_global_ue
+                    ),
+                )
+            )
+
+        else:
+
+            channel_seed = (
+                _microbatch_channel_seed(
+                    context=context,
+
+                    tti_index=tti_index,
+
+                    real_cell_index=(
+                        real_cell_index
+                    ),
+
+                    microbatch_index=(
+                        microbatch_index
+                    ),
+                )
+            )
+
+        channel = (
+            context
+            .channel_runtime
+            .generate(
+                topology=(
+                    microbatch_topology
+                ),
+
+                seed=channel_seed,
+
+                batch_size=(
+                    context
+                    .topology_config
+                    .batch_size
+                ),
+            )
+        )
+
+        return channel.h_freq
+
+
+    if mode != "velocity_window":
+        raise RuntimeError(
+            "Unexpected temporal radio mode."
+        )
+
+
+    (
+        window_index,
+        window_start_tti,
+        offset,
+    ) = _temporal_window_coordinates(
+        tti_index=tti_index,
+
+        window_ttis=(
+            context
+            .config
+            .temporal_window_ttis
+        ),
+    )
+
+
+    #
+    # Move persistent UE geometry only to the
+    # beginning of the radio window.
+    #
+    # Sionna velocity then evolves the fast channel
+    # samples INSIDE that short window.
+    #
+    mobility_snapshot = (
+        build_mobility_snapshot(
+            initial_topology=(
+                context.topology
+            ),
+
+            config=MobilityConfig(
+                tti_duration_s=(
+                    context
+                    .config
+                    .tti_duration_s
+                ),
+
+                trajectory_mode=(
+                    "static"
+                    if (
+                        context
+                        .config
+                        .ut_speed_kmh
+                        == 0.0
+                    )
+                    else
+                    "constant_velocity"
+                ),
+
+                association_mode="fixed",
+
+                max_horizontal_displacement_m=(
+                    context
+                    .config
+                    .temporal_max_displacement_m
+                ),
+            ),
+
+            tti_index=(
+                window_start_tti
+            ),
+        )
+    )
+
+
+    microbatch_topology = (
+        subset_topology_ues(
+            topology=(
+                mobility_snapshot
+                .topology
+            ),
+
+            global_ue_indices=(
+                microbatch_global_ue_indices
+            ),
+        )
+    )
+
+
+    runtime = (
+        context
+        .temporal_channel_runtime
+    )
+
+    if runtime is None:
+        raise RuntimeError(
+            "velocity_window mode requires "
+            "temporal_channel_runtime."
+        )
+
+
+    if identity_stable:
+
+        assert (
+            identity_global_ue
+            is not None
+        )
+
+        channel_seed = (
+            _identity_stable_temporal_ue_seed(
+                context=context,
+
+                window_index=window_index,
+
+                global_ue_index=(
+                    identity_global_ue
+                ),
+            )
+        )
+
+    else:
+
+        channel_seed = (
+            _temporal_microbatch_channel_seed(
+                context=context,
+
+                window_index=window_index,
+
+                real_cell_index=(
+                    real_cell_index
+                ),
+
+                microbatch_index=(
+                    microbatch_index
+                ),
+            )
+        )
+
+
+    #
+    # MEMORY-SAFE TEMPORAL PATH
+    # -------------------------
+    #
+    # Generate the complete W-sample correlated CIR
+    # realization, but select the requested temporal
+    # coefficient BEFORE OFDM/subcarrier expansion.
+    #
+    # Therefore the production scheduler never
+    # materializes a W-sample full paper-MIMO
+    # frequency tensor merely to consume one TTI.
+    #
+    return runtime.generate_tti_slice(
+        topology=microbatch_topology,
+
+        seed=channel_seed,
+
+        batch_size=(
+            context
+            .topology_config
+            .batch_size
+        ),
+
+        num_ttis=(
+            context
+            .config
+            .temporal_window_ttis
+        ),
+
+        tti_duration_s=(
+            context
+            .config
+            .tti_duration_s
+        ),
+
+        tti_offset=offset,
     )
 
 
@@ -2222,6 +2949,10 @@ def _build_cell_training_inputs(
     context: ChunkedSionnaPPOContext,
     tti_index: int,
     stream_index: int,
+
+    cell_global_ue_indices_override: (
+        torch.Tensor | None
+    ) = None,
 ) -> PPOTrainingTTIInputs:
     """
     Build one PPO stream's real Sionna inputs.
@@ -2262,12 +2993,99 @@ def _build_cell_training_inputs(
         ]
     )
 
-    cell_global_ue_indices = (
-        context
-        .global_ue_indices_by_stream[
-            stream_index
-        ]
-    )
+    if (
+        cell_global_ue_indices_override
+        is None
+    ):
+
+        cell_global_ue_indices = (
+            context
+            .global_ue_indices_by_stream[
+                stream_index
+            ]
+        )
+
+    else:
+
+        cell_global_ue_indices = (
+            cell_global_ue_indices_override
+        )
+
+        if (
+            cell_global_ue_indices.ndim
+            != 1
+        ):
+            raise ValueError(
+                "Dynamic cell UE membership must "
+                "have shape [UE]."
+            )
+
+        if (
+            cell_global_ue_indices.dtype
+            == torch.bool
+            or torch.is_floating_point(
+                cell_global_ue_indices
+            )
+        ):
+            raise ValueError(
+                "Dynamic cell UE identities must "
+                "use an integer dtype."
+            )
+
+        if (
+            cell_global_ue_indices.device
+            != context.topology.ut_loc.device
+        ):
+            raise ValueError(
+                "Dynamic cell UE identities are "
+                "on the wrong device."
+            )
+
+        if int(
+            cell_global_ue_indices.numel()
+        ) == 0:
+            raise ValueError(
+                "Dynamic selected cell has zero "
+                "serving UEs. Empty-cell scheduler "
+                "support is not implemented yet."
+            )
+
+        if torch.any(
+            cell_global_ue_indices < 0
+        ):
+            raise ValueError(
+                "Dynamic cell UE identities cannot "
+                "be negative."
+            )
+
+        if torch.any(
+            cell_global_ue_indices
+            >= context.num_global_ues
+        ):
+            raise ValueError(
+                "Dynamic cell UE identity outside "
+                "global topology."
+            )
+
+        if (
+            torch.unique(
+                cell_global_ue_indices
+            ).numel()
+            != cell_global_ue_indices.numel()
+        ):
+            raise ValueError(
+                "Dynamic cell UE identities must "
+                "be unique."
+            )
+
+        cell_global_ue_indices = (
+            cell_global_ue_indices
+            .detach()
+            .clone()
+            .to(
+                dtype=torch.long,
+            )
+        )
 
     microbatch_specs = (
         _partition_cell_global_ue_indices(
@@ -2305,93 +3123,29 @@ def _build_cell_training_inputs(
     ) in enumerate(
         microbatch_specs
     ):
-        microbatch_topology = (
-            subset_topology_ues(
-                topology=context.topology,
+        with perf_region(
+            "radio.channel_generation",
+            device=context.config.device,
+        ):
+            h_freq = (
+                _generate_microbatch_h_freq(
+                    context=context,
 
-                global_ue_indices=(
-                    microbatch_global_ue_indices
-                ),
+                    tti_index=tti_index,
+
+                    real_cell_index=(
+                        real_cell_index
+                    ),
+
+                    microbatch_index=(
+                        microbatch_index
+                    ),
+
+                    microbatch_global_ue_indices=(
+                        microbatch_global_ue_indices
+                    ),
+                )
             )
-        )
-
-        channel_seed = (
-            _microbatch_channel_seed(
-                context=context,
-
-                tti_index=(
-                    tti_index
-                ),
-
-                real_cell_index=(
-                    real_cell_index
-                ),
-
-                microbatch_index=(
-                    microbatch_index
-                ),
-            )
-        )
-
-        channel_config = ChannelConfig(
-            carrier_frequency_hz=4.0e9,
-
-            subcarrier_spacing_hz=30.0e3,
-
-            num_rbs=(
-                context.config.num_rbs
-            ),
-
-            subcarriers_per_rb=(
-                context
-                .config
-                .subcarriers_per_rb
-            ),
-
-            num_ofdm_symbols=1,
-
-            antenna_mode="paper",
-
-            direction="downlink",
-
-            o2i_model="low",
-
-            enable_pathloss=True,
-
-            enable_shadow_fading=True,
-
-            precision="single",
-
-            device=(
-                context.config.device
-            ),
-
-            seed=channel_seed,
-        )
-
-        channel = (
-            generate_frequency_channel(
-                topology=(
-                    microbatch_topology
-                ),
-
-                topology_config=(
-                    context.topology_config
-                ),
-
-                channel_config=(
-                    channel_config
-                ),
-            )
-        )
-
-        #
-        # This H is intentionally retained.
-        #
-        # The rest of ChannelData/Sionna's model
-        # should NOT survive this microbatch.
-        #
-        h_freq = channel.h_freq
 
         num_microbatch_ues = int(
             h_freq.shape[1]
@@ -2446,117 +3200,177 @@ def _build_cell_training_inputs(
         # RI / CSI
         # ======================================================
 
-        rank_data = (
-            compute_ideal_svd_rank_diagnostic(
-                h_freq=h_freq,
+        # rank_data = (
+        #     compute_ideal_svd_rank_diagnostic(
+        #         h_freq=h_freq,
 
-                serving_bs=(
-                    local_serving_bs
-                ),
+        #         serving_bs=(
+        #             local_serving_bs
+        #         ),
 
-                num_rbgs=(
-                    context
-                    .config
-                    .num_rbgs
-                ),
+        #         num_rbgs=(
+        #             context
+        #             .config
+        #             .num_rbgs
+        #         ),
 
-                tx_power_per_subcarrier_w=(
-                    context
-                    .tx_power_per_subcarrier_w
-                ),
+        #         tx_power_per_subcarrier_w=(
+        #             context
+        #             .tx_power_per_subcarrier_w
+        #         ),
 
-                noise_power_per_subcarrier_w=(
-                    context
-                    .noise_power_per_subcarrier_w
-                ),
+        #         noise_power_per_subcarrier_w=(
+        #             context
+        #             .noise_power_per_subcarrier_w
+        #         ),
+        #     )
+        # )
+
+
+        with perf_region(
+            "radio.rank_diagnostic",
+            device=context.config.device,
+        ):
+            rank_data = (
+                compute_ideal_svd_rank_diagnostic(
+                    h_freq=h_freq,
+                    serving_bs=(
+                        local_serving_bs
+                    ),
+                    num_rbgs=(
+                        context
+                        .config
+                        .num_rbgs
+                    ),
+                    tx_power_per_subcarrier_w=(
+                        context
+                        .tx_power_per_subcarrier_w
+                    ),
+                    noise_power_per_subcarrier_w=(
+                        context
+                        .noise_power_per_subcarrier_w
+                    ),
+                )
             )
-        )
 
-        serving_mimo = (
-            extract_serving_mimo_rbg_channel(
-                h_freq=h_freq,
+        # serving_mimo = (
+        #     extract_serving_mimo_rbg_channel(
+        #         h_freq=h_freq,
 
-                serving_bs=(
-                    local_serving_bs
-                ),
+        #         serving_bs=(
+        #             local_serving_bs
+        #         ),
 
-                num_rbgs=(
-                    context
-                    .config
-                    .num_rbgs
-                ),
+        #         num_rbgs=(
+        #             context
+        #             .config
+        #             .num_rbgs
+        #         ),
+        #     )
+        # )
+
+        # csi_data = compute_ideal_svd_csi(
+        #     h_serving_rbg=(
+        #         rank_data
+        #         .h_serving_rbg
+        #     ),
+
+        #     rank1_rbg_score=(
+        #         rank_data
+        #         .rank1_rbg_spectral_efficiency
+        #     ),
+
+        #     rank2_rbg_score=(
+        #         rank_data
+        #         .rank2_rbg_spectral_efficiency
+        #     ),
+        # )
+
+        with perf_region(
+            "radio.csi",
+            device=context.config.device,
+        ):
+            csi_data = (
+                compute_ideal_svd_csi(
+                    h_serving_rbg=(
+                        rank_data
+                        .h_serving_rbg
+                    ),
+                    rank1_rbg_score=(
+                        rank_data
+                        .rank1_rbg_spectral_efficiency
+                    ),
+                    rank2_rbg_score=(
+                        rank_data
+                        .rank2_rbg_spectral_efficiency
+                    ),
+                )
             )
-        )
-
-        csi_data = compute_ideal_svd_csi(
-            h_serving_rbg=(
-                serving_mimo
-                .h_serving_rbg
-            ),
-
-            rank1_rbg_score=(
-                rank_data
-                .rank1_rbg_spectral_efficiency
-            ),
-
-            rank2_rbg_score=(
-                rank_data
-                .rank2_rbg_spectral_efficiency
-            ),
-        )
 
         # ======================================================
         # SU REPORTS NEEDED FOR PF-TDS + 1LDS STATE
         # ======================================================
+        with perf_region(
+            "radio.su_reports",
+            device=context.config.device,
+        ):
+            su_report = (
+                build_single_user_phy_reports(
+                    h_freq=h_freq,
 
-        su_report = (
-            build_single_user_phy_reports(
-                h_freq=h_freq,
+                    serving_bs=(
+                        local_serving_bs
+                    ),
 
-                serving_bs=(
-                    local_serving_bs
-                ),
+                    recommended_rank=(
+                        csi_data
+                        .recommended_rank
+                    ),
 
-                recommended_rank=(
-                    csi_data
-                    .recommended_rank
-                ),
+                    precoder_directions=(
+                        csi_data
+                        .precoder_directions
+                    ),
 
-                precoder_directions=(
-                    csi_data
-                    .precoder_directions
-                ),
+                    num_rbgs=(
+                        context.config.num_rbgs
+                    ),
 
-                num_rbgs=(
-                    context.config.num_rbgs
-                ),
+                    subcarriers_per_rbg=(
+                        context
+                        .config
+                        .subcarriers_per_rb
+                    ),
 
-                subcarriers_per_rbg=(
-                    context
-                    .config
-                    .subcarriers_per_rb
-                ),
+                    tx_power_per_subcarrier_w=(
+                        context
+                        .tx_power_per_subcarrier_w
+                    ),
 
-                tx_power_per_subcarrier_w=(
-                    context
-                    .tx_power_per_subcarrier_w
-                ),
+                    noise_power_per_subcarrier_w=(
+                        context
+                        .noise_power_per_subcarrier_w
+                    ),
 
-                noise_power_per_subcarrier_w=(
-                    context
-                    .noise_power_per_subcarrier_w
-                ),
+                    link_adaptation_config=(
+                        context
+                        .link_adaptation_config
+                    ),
 
-                link_adaptation_config=(
-                    context
-                    .link_adaptation_config
-                ),
+                    rate_config=(
+                        context.rate_config
+                    ),
+                    precomputed_serving_channel=(
+                        rank_data
+                        .h_serving_rbg
+                    ),
 
-                rate_config=(
-                    context.rate_config
-                ),
+                    precomputed_inter_cell_covariance=(
+                        rank_data
+                        .inter_cell_covariance
+                    ),
+                )
             )
-        )
 
         local_rbg_rate_bps = (
             su_report
@@ -2583,30 +3397,33 @@ def _build_cell_training_inputs(
                 device=h_freq.device,
             )
         )
+        with perf_region(
+            "radio.cqi",
+            device=context.config.device,
+        ):
+            cqi = build_cqi_surrogate(
+                mcs_index=(
+                    su_report
+                    .link_adaptation
+                    .mcs_index[
+                        0
+                    ]
+                ),
 
-        cqi = build_cqi_surrogate(
-            mcs_index=(
-                su_report
-                .link_adaptation
-                .mcs_index[
-                    0
-                ]
-            ),
+                meets_bler_target=(
+                    su_report
+                    .link_adaptation
+                    .meets_bler_target[
+                        0
+                    ]
+                ),
 
-            meets_bler_target=(
-                su_report
-                .link_adaptation
-                .meets_bler_target[
-                    0
-                ]
-            ),
+                candidate_valid_mask=(
+                    local_valid_mask
+                ),
 
-            candidate_valid_mask=(
-                local_valid_mask
-            ),
-
-            config=CQISurrogateConfig(),
-        )
+                config=CQISurrogateConfig(),
+            )
 
         # ======================================================
         # RETAIN ONLY WHAT SURVIVES THIS MICROBATCH
@@ -2707,7 +3524,6 @@ def _build_cell_training_inputs(
 
         del su_report
 
-        del serving_mimo
 
         del rank_data
 
@@ -2721,10 +3537,14 @@ def _build_cell_training_inputs(
 
         del local_serving_bs
 
-        del channel
-
-        del microbatch_topology
-
+        #
+        # channel and microbatch_topology now live
+        # inside _generate_microbatch_h_freq().
+        #
+        # They leave scope automatically when that
+        # helper returns, so there is nothing to
+        # delete here.
+        #
         del h_freq
 
     microbatches = tuple(
@@ -2746,18 +3566,21 @@ def _build_cell_training_inputs(
     #
     # PF-TDS happens AFTER this.
     # ==========================================================
+    with perf_region(
+        "radio.combine_microbatches",
+        device=context.config.device,
+    ):
+        observation = (
+            _combine_cell_radio_microbatches(
+                cell_global_ue_indices=(
+                    cell_global_ue_indices
+                ),
 
-    observation = (
-        _combine_cell_radio_microbatches(
-            cell_global_ue_indices=(
-                cell_global_ue_indices
-            ),
-
-            microbatches=(
-                microbatches
-            ),
+                microbatches=(
+                    microbatches
+                ),
+            )
         )
-    )
 
     # ==========================================================
     # LAZY CANDIDATE PHY COMPACTION
@@ -2915,8 +3738,57 @@ class CellChunkedSionnaPPOInputProvider:
         self,
         *,
         context: ChunkedSionnaPPOContext,
+
+        global_ue_indices_provider: (
+            Callable[
+                [
+                    int,
+                    int,
+                ],
+                torch.Tensor,
+            ]
+            | None
+        ) = None,
     ) -> None:
         self.context = context
+
+        self.global_ue_indices_provider = (
+            global_ue_indices_provider
+        )
+
+        #
+        # Production dynamic membership must use
+        # identity-stable channel RNG.
+        #
+        # Minimal fake contexts in unit tests may not
+        # expose config, so enforce this only when a
+        # real config object is available.
+        #
+        if (
+            global_ue_indices_provider
+            is not None
+        ):
+            config = getattr(
+                context,
+                "config",
+                None,
+            )
+
+            if (
+                config is not None
+                and not bool(
+                    getattr(
+                        config,
+                        "identity_stable_ue_channel_rng",
+                        False,
+                    )
+                )
+            ):
+                raise ValueError(
+                    "Dynamic Sionna membership "
+                    "requires identity-stable "
+                    "UE channel RNG."
+                )
 
         self._current_tti_index: (
             int | None
@@ -2947,6 +3819,27 @@ class CellChunkedSionnaPPOInputProvider:
     ) -> int:
         return (
             self._num_stream_builds
+        )
+
+    @property
+    def num_channel_generations(
+        self,
+    ) -> int:
+        return (
+            self.context
+            .channel_runtime
+            .num_generations
+        )
+
+
+    @property
+    def num_channel_topology_resets(
+        self,
+    ) -> int:
+        return (
+            self.context
+            .channel_runtime
+            .num_topology_resets
         )
 
 
@@ -3087,17 +3980,81 @@ class CellChunkedSionnaPPOInputProvider:
         if existing is not None:
             return existing
 
-        inputs = (
-            _build_cell_training_inputs(
-                context=self.context,
+        # inputs = (
+        #     _build_cell_training_inputs(
+        #         context=self.context,
 
-                tti_index=tti_index,
+        #         tti_index=tti_index,
 
-                stream_index=(
-                    stream_index
-                ),
-            )
+        #         stream_index=(
+        #             stream_index
+        #         ),
+        #     )
+        # )
+
+        #
+        # Production ChunkedSionnaPPOContext has
+        # context.config.device.
+        #
+        # Some pure-logic unit tests intentionally use
+        # a minimal fake context containing only
+        # num_streams. Profiling must not impose extra
+        # runtime requirements on that interface.
+        #
+        profile_config = getattr(
+            self.context,
+            "config",
+            None,
         )
+
+        profile_device = getattr(
+            profile_config,
+            "device",
+            None,
+        )
+
+        with perf_region(
+            "radio.cell_input_total",
+            device=profile_device,
+        ):
+
+            if (
+                self.global_ue_indices_provider
+                is None
+            ):
+
+                #
+                # Preserve the original static path.
+                #
+                inputs = (
+                    _build_cell_training_inputs(
+                        context=self.context,
+                        tti_index=tti_index,
+                        stream_index=stream_index,
+                    )
+                )
+
+            else:
+
+                dynamic_global_ue_indices = (
+                    self
+                    .global_ue_indices_provider(
+                        tti_index,
+                        stream_index,
+                    )
+                )
+
+                inputs = (
+                    _build_cell_training_inputs(
+                        context=self.context,
+                        tti_index=tti_index,
+                        stream_index=stream_index,
+
+                        cell_global_ue_indices_override=(
+                            dynamic_global_ue_indices
+                        ),
+                    )
+                )
 
         self._current_inputs_by_stream[
             stream_index

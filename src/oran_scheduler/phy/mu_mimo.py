@@ -1109,7 +1109,7 @@ def build_rank1_effective_channel(
 
 def compute_rzf_matrix(
     effective_channel: torch.Tensor,
-    alpha: float,
+    alpha: float | torch.Tensor,
     precision: str = "single",
 ) -> torch.Tensor:
     """
@@ -1153,7 +1153,15 @@ def compute_rzf_matrix(
             "the number of TX antennas."
         )
 
-    if alpha < 0.0:
+    alpha_tensor = torch.as_tensor(
+        alpha,
+        dtype=effective_channel.real.dtype,
+        device=effective_channel.device,
+    )
+
+    if torch.any(
+        alpha_tensor < 0.0
+    ):
         raise ValueError(
             "RZF alpha cannot be negative."
         )
@@ -1177,7 +1185,7 @@ def compute_rzf_matrix(
     precoding_matrix = (
         rzf_precoding_matrix(
             effective_channel,
-            alpha=alpha,
+            alpha=alpha_tensor,
             precision=precision,
         )
     )

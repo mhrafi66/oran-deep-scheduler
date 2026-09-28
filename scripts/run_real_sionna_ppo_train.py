@@ -95,18 +95,18 @@ from oran_scheduler.rl.ppo_checkpoint import (
 )
 
 METRICS_PATH = Path(
-    "experiments/"
-    "notchpeak_21cell_ppo_training_metrics.csv"
+    "experiments/training/"
+    "paper_1lds_ppo_500tti_metrics.csv"
 )
 
 KPI_METRICS_PATH = Path(
-    "experiments/"
-    "notchpeak_21cell_ppo_kpi_metrics.csv"
+    "experiments/training/"
+    "paper_1lds_ppo_500tti_kpi_metrics.csv"
 )
 
 CHECKPOINT_PATH = Path(
     "experiments/checkpoints/"
-    "ppo_1lds_notchpeak_latest.pt"
+    "paper_1lds_ppo_500tti.pt"
 )
 
 DEVICE = torch.device(
@@ -146,7 +146,7 @@ UE_MICROBATCH_SIZE = 4
 # Scalability probe only:
 #
 # advance exactly one paper-sized warm-up TTI.
-NUM_TTIS = 1000
+NUM_TTIS = 500
 
 
 # --------------------------------------------------------------
@@ -279,7 +279,7 @@ TTI_DURATION_S = 0.5e-3
 # real-Sionna run proves an actual PPO/JSD update.
 #
 # Paper uses first_collection_tti_index = 100.
-FIRST_COLLECTION_TTI_INDEX = 0
+FIRST_COLLECTION_TTI_INDEX = 100
 
 def module_parameter_norm(
     module: torch.nn.Module,
@@ -1215,7 +1215,7 @@ def main() -> None:
             update_config=(
                 PPOMultiStreamUpdateConfig(
                     boundary_mode=(
-                        # "require_exact"
+                        # "use_all_when_reached"
                         "use_all_when_reached"
                     ),
                 )
