@@ -17,7 +17,7 @@ Hot-path choices:
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 from typing import Iterable, Literal, Mapping
 
@@ -131,6 +131,8 @@ class _FlowState:
     expired_dropped_packets: int = 0
     expired_dropped_bytes: int = 0
     deadline_misses: int = 0
+    # Exact histogram updated once per completed packet, no per-TTI scan.
+    completed_delay_slots: dict[int, int] = field(default_factory=dict)
 
     def compact_heads(self) -> None:
         while self.packets and not self.packets[0].active:
@@ -304,6 +306,17 @@ class ServiceAwareTrafficManager:
             deadline_misses=state.deadline_misses,
         )
 
+    def completed_delay_histogram(self, ue_index: int, flow_id: str) -> tuple[tuple[int, int], ...]:
+        """Exact completed-packet sojourn times, in slots including arrival.
+
+        For reporting only: O(distinct completed delay values); NOT used in
+        scheduling observations or the per-TTI hot path.
+        """
+        key = (ue_index, flow_id)
+        if key not in self._states:
+            raise ValueError(f"Unknown flow: {key!r}.")
+        return tuple(sorted(self._states[key].completed_delay_slots.items()))
+
     def _adjust_backlog(self, state: _FlowState, delta: int) -> None:
         state.backlog_bytes += delta
         self._per_ue_backlog[state.spec.ue_index] += delta
@@ -458,6 +471,10 @@ class ServiceAwareTrafficManager:
                     packet.active = False
                     state.packet_count -= 1
                     state.completed_packets += 1
+                    delay_slots = tti_index - packet.arrival_tti + 1
+                    state.completed_delay_slots[delay_slots] = (
+                        state.completed_delay_slots.get(delay_slots, 0) + 1
+                    )
                     completed += 1
                     if packet.deadline_missed:
                         state.late_completed_packets += 1
@@ -482,9 +499,16 @@ class ServiceAwareTrafficManager:
             delivered_bytes_by_ue=tuple(delivered_by_ue),
         )
 
-    def reset(self, *, seed: int | None = None) -> None:
-        """Clear traffic between episodes; optionally reseed FTP3 sampling."""
-        if self._active_tti is not None:
+    def reset(self, *, seed: int | None = None, discard_active_tti: bool = False) -> None:
+        """Clear episode; explicit opt-in permits aborting a failed active TTI.
+
+        discard_active_tti=True is intended ONLY for abandoning/replaying the
+        entire episode after an invalid policy/link-provider call. It must not
+        be used as an ordinary queue rollback or per-TTI skip.
+        """
+        if type(discard_active_tti) is not bool:
+            raise TypeError("discard_active_tti must be a bool")
+        if self._active_tti is not None and not discard_active_tti:
             raise RuntimeError("Cannot reset in the middle of a TTI.")
         if seed is not None:
             _nonnegative_int(seed, "seed")
@@ -492,6 +516,7 @@ class ServiceAwareTrafficManager:
         for state in self._states.values():
             state.packets.clear()
             state.pending_deadlines.clear()
+            state.completed_delay_slots.clear()
             for name in (
                 "backlog_bytes", "packet_count", "arrived_packets", "arrived_bytes",
                 "admitted_packets", "delivered_bytes", "completed_packets",

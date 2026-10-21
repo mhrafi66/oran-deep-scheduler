@@ -1075,7 +1075,11 @@ def evaluate_cell_allocation(
     precomputed_candidate_inter_cell_covariance: (
         torch.Tensor | None
     ) = None,
-) -> CellAllocationEvaluationData:
+    # Optional Task-5 passive capture of already-computed RBG MU-MIMO SINR.
+    # None preserves all original evaluation behavior and cost.
+    capture_post_precoder_sinr: object | None = None,
+    capture_only: bool = False,
+) -> CellAllocationEvaluationData | None:
     """
     Physically evaluate every RBG of one cell allocation.
 
@@ -1099,6 +1103,15 @@ def evaluate_cell_allocation(
             subcarrier,
         ]
     """
+
+    # Explicit opt-in: when building Task-5 whole-grant links, suppress the
+    # expensive legacy *per-RBG* link-adaptation calls. Caller gets no legacy
+    # rate evaluation in this mode, only the passive SINR capture side effect.
+    # The default path remains byte-for-byte equivalent in behavior.
+    if type(capture_only) is not bool:
+        raise TypeError("capture_only must be a bool")
+    if capture_only and not callable(capture_post_precoder_sinr):
+        raise ValueError("capture_only requires capture_post_precoder_sinr callback")
 
     if candidate_global_ue_indices.ndim != 1:
         raise ValueError(
@@ -1457,6 +1470,23 @@ def evaluate_cell_allocation(
         )
 
 
+        if capture_post_precoder_sinr is not None:
+            if not callable(capture_post_precoder_sinr):
+                raise TypeError("capture_post_precoder_sinr must be callable")
+            capture_post_precoder_sinr(
+                rbg_index=rbg_index,
+                selected_candidate_indices=selected_candidate_indices,
+                selected_ranks=selected_ranks,
+                layer_sinr_linear=rbg_phy_data.sinr_data.sinr_linear,
+                layer_ue_indices=rbg_phy_data.layer_ue_indices,
+                layer_index_within_ue=rbg_phy_data.layer_index_within_ue,
+            )
+
+        if capture_only:
+            # All useful post-precoder SINR is already captured. A second
+            # per-RBG PHYAbstraction is redundant for whole-grant service.
+            continue
+
         rate_data = (
             compute_mu_mimo_rbg_rates(
                 layer_sinr_linear=(
@@ -1517,6 +1547,9 @@ def evaluate_cell_allocation(
     total_cell_target_compliant_rate_bps = (
         total_rbg_target_compliant_rate_bps.sum()
     )
+
+    if capture_only:
+        return None
 
     return CellAllocationEvaluationData(
         candidate_nominal_rate_bps=(
