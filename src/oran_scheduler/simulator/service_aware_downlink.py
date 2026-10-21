@@ -339,6 +339,11 @@ class ServiceAwareDownlinkCellRunner:
         if type(tti_index) is not int or tti_index != self._next_tti:
             raise ValueError(f"Expected contiguous TTI {self._next_tti}")
         started = self.queues.begin_tti(tti_index=tti_index, arrivals=arrivals)
+        # Optional, opt-in HARQ feedback maturation. The legacy decoder has
+        # no such hook, preserving the original Task-5 execution path.
+        prepare = getattr(self.decoder, "prepare_tti", None)
+        if prepare is not None:
+            prepare(queues=self.queues)
         observed = self.observer.observe()
         decision = self.policy(observed)
         if not isinstance(decision, DownlinkSchedulingDecision):
