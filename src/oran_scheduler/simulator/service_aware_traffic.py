@@ -262,6 +262,19 @@ class ServiceAwareTrafficManager:
     def last_completed_tti_index(self) -> int | None:
         return self._last_completed_tti
 
+    @property
+    def active_tti_index(self) -> int | None:
+        """TTI whose arrivals have been admitted but service is not finalized."""
+        return self._active_tti
+
+    def configured_flows(self) -> tuple[QoSFlowSpec, ...]:
+        """Immutable configured flow descriptions, in stable insertion order.
+
+        This is O(number of configured flows), with no queued-packet scan.
+        Intended for constructing a long-lived per-cell QoS observer once.
+        """
+        return tuple(state.spec for state in self._states.values())
+
     def ue_backlog_bytes(self) -> tuple[int, ...]:
         """Cheap snapshot of cached aggregate UE backlog (no packet scan)."""
         return tuple(self._per_ue_backlog)
